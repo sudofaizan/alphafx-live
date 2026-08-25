@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import json
 import os
+import ssl
 import threading
 import time
 import urllib.error
@@ -56,6 +57,7 @@ from datetime import datetime, timedelta
 from functools import wraps
 from typing import Any, Callable
 
+import certifi
 import MetaTrader5 as mt5
 from flask import Flask, jsonify, request
 
@@ -63,7 +65,7 @@ from flask import Flask, jsonify, request
 # Config
 # ---------------------------------------------------------------------------
 API_KEY = "alphafx"
-API_VERSION = "1.7.2"
+API_VERSION = "1.7.3"
 MT5_PATH = os.environ.get("MT5_TERMINAL_PATH", "")
 HOST = "0.0.0.0"
 PORT = 8080
@@ -1690,6 +1692,13 @@ def mask_telegram_token(token: str) -> str:
     return f"{t[:8]}****{t[-4:]}"
 
 
+def _telegram_ssl_context() -> ssl.SSLContext:
+    """Windows VPS often lacks CA certs — use certifi. Set TELEGRAM_SSL_VERIFY=false if behind SSL-inspecting proxy."""
+    if os.environ.get("TELEGRAM_SSL_VERIFY", "true").lower() in ("0", "false", "no"):
+        return ssl._create_unverified_context()
+    return ssl.create_default_context(cafile=certifi.where())
+
+
 def send_telegram_message(text: str) -> dict[str, Any]:
     """Send HTML message to configured Telegram channel."""
     token = TELEGRAM_BOT_TOKEN.strip()
@@ -1709,8 +1718,9 @@ def send_telegram_message(text: str) -> dict[str, Any]:
         headers={"Content-Type": "application/json"},
         method="POST",
     )
+    ssl_ctx = _telegram_ssl_context()
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
+        with urllib.request.urlopen(req, timeout=20, context=ssl_ctx) as resp:
             body = json.loads(resp.read().decode("utf-8"))
         if body.get("ok"):
             return {"ok": True, "message_id": (body.get("result") or {}).get("message_id")}
