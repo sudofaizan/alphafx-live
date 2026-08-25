@@ -1920,7 +1920,8 @@ class TelegramAlertManager:
         if tg.get("ok"):
             return {
                 "ok": True,
-                "message": "Test notification sent",
+                "message": "Test notification sent via server",
+                "sent_via": "server",
                 "channel": TELEGRAM_CHAT_ID,
                 "message_id": tg.get("message_id"),
             }
