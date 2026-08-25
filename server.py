@@ -48,7 +48,7 @@ from flask import Flask, jsonify, request
 # Config
 # ---------------------------------------------------------------------------
 API_KEY = "alphafx"
-API_VERSION = "1.5.2"
+API_VERSION = "1.5.3"
 MT5_PATH = os.environ.get("MT5_TERMINAL_PATH", "")
 HOST = "0.0.0.0"
 PORT = 8080
@@ -2000,7 +2000,9 @@ def build_trade_suggestion(sym: str, chart_tf: str, count: int = 200) -> dict[st
             tp = swing_tp
         return entry, sl, min(tp, entry - atr * 1.5)
 
-    def setup_issues(side: str, entry: float, sl: float, tp: float, ob: dict) -> list[str]:
+    def setup_issues(
+        side: str, entry: float, sl: float, tp: float, ob: dict, max_dist_atr: float = 2.5,
+    ) -> list[str]:
         issues: list[str] = []
         risk = abs(entry - sl)
         reward = abs(tp - entry)
@@ -2022,9 +2024,11 @@ def build_trade_suggestion(sym: str, chart_tf: str, count: int = 200) -> dict[st
         if rr > 4.0:
             issues.append(f"R:R unrealistic ({rr:.1f})")
         dist = float(ob.get("distance_atr") or 0)
-        if dist > 2.5 and ob.get("status") not in ("FRESH", "AT_ZONE"):
-            issues.append(f"zone {dist}x ATR away — weak retest odds")
+        if dist > max_dist_atr and ob.get("status") not in ("FRESH", "AT_ZONE"):
+            issues.append(f"zone {dist}x ATR away — wait for closer retest")
         return issues
+
+    last_reject: list[str] = []
 
     def try_setup(
         order_type: str,
@@ -2035,10 +2039,12 @@ def build_trade_suggestion(sym: str, chart_tf: str, count: int = 200) -> dict[st
         reason: str,
         confidence: str,
         ob: dict,
+        max_dist_atr: float = 2.5,
     ) -> bool:
         nonlocal setup
-        bad = setup_issues(side, entry, sl, tp, ob)
+        bad = setup_issues(side, entry, sl, tp, ob, max_dist_atr=max_dist_atr)
         if bad:
+            last_reject[:] = bad
             return False
         setup = make_setup(order_type, side, entry, sl, tp, reason, confidence, ob)
         return True
@@ -2117,9 +2123,11 @@ def build_trade_suggestion(sym: str, chart_tf: str, count: int = 200) -> dict[st
         bulls = [ob for ob in blocks if ob["type"] == "BULLISH_OB"]
         ob = None
         if prefer_sell and bears:
-            ob = bears[0]
+            bears_fit = sorted([o for o in bears if o["high"] > bid], key=lambda o: float(o.get("distance") or 0))
+            ob = bears_fit[0] if bears_fit else bears[0]
         elif prefer_buy and bulls:
-            ob = bulls[0]
+            bulls_fit = sorted([o for o in bulls if o["low"] < ask], key=lambda o: float(o.get("distance") or 0))
+            ob = bulls_fit[0] if bulls_fit else bulls[0]
         elif bears and not bulls:
             ob = bears[0]
         elif bulls and not bears:
@@ -2127,6 +2135,11 @@ def build_trade_suggestion(sym: str, chart_tf: str, count: int = 200) -> dict[st
         elif blocks:
             ob = blocks[0]
         if ob:
+            aligned = (prefer_buy and ob["type"] == "BULLISH_OB") or (prefer_sell and ob["type"] == "BEARISH_OB")
+            max_dist = 4.0 if aligned and ob.get("status") in ("FRESH", "TESTED") else 2.5
+            conf = ob.get("intensity_tier", "MED")
+            if ob.get("status") == "TESTED":
+                conf = "MED"
             if ob["type"] == "BEARISH_OB":
                 entry, sl, tp = prices_for_sell_ob(ob)
                 if ob.get("status") == "AT_ZONE":
@@ -2140,7 +2153,7 @@ def build_trade_suggestion(sym: str, chart_tf: str, count: int = 200) -> dict[st
                 try_setup(
                     order_type, "SELL", entry, sl, tp,
                     f"NEUTRAL / {chart_tf} {chart_trend} — bearish OB ({ob.get('volume_k', '?')}) · {ob.get('status', 'FRESH')}",
-                    ob.get("intensity_tier", "MED"), ob,
+                    conf, ob, max_dist_atr=max_dist,
                 )
             else:
                 entry, sl, tp = prices_for_buy_ob(ob)
@@ -2155,7 +2168,7 @@ def build_trade_suggestion(sym: str, chart_tf: str, count: int = 200) -> dict[st
                 try_setup(
                     order_type, "BUY", entry, sl, tp,
                     f"NEUTRAL / {chart_tf} {chart_trend} — bullish OB ({ob.get('volume_k', '?')}) · {ob.get('status', 'FRESH')}",
-                    ob.get("intensity_tier", "MED"), ob,
+                    conf, ob, max_dist_atr=max_dist,
                 )
 
     # --- RSI OB fallback when trend branches did not fire ---
@@ -2195,7 +2208,12 @@ def build_trade_suggestion(sym: str, chart_tf: str, count: int = 200) -> dict[st
                 f"(don't fade strength; {bears_n} bearish zone(s) above ignored)"
             )
         else:
-            message = f"No setup — {valid_n} valid OB(s) but none match current trend filter"
+            if last_reject:
+                message = f"No setup — {'; '.join(last_reject)}"
+            elif valid_n > 0:
+                message = f"No setup — {valid_n} valid OB(s) found but filters rejected the trade"
+            else:
+                message = f"No setup — {valid_n} valid OB(s) but none match current trend filter"
         return {
             "ok": True,
             "has_setup": False,
