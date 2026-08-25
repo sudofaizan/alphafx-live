@@ -1,2366 +1,2298 @@
+#!/usr/bin/env python3
 """
-MT5 REST API Server - Full Featured (No numpy)
-"""
-from flask import Flask, jsonify, request
-import MetaTrader5 as mt5
-from datetime import datetime, timedelta
+MT5 VPS Trade API — single-file server for Windows VPS with MetaTrader 5.
 
-# Import SMC Analysis Module (official documented methodology)
-try:
-    from smc_analysis import SMCAnalyzer, analyze_smc, calculate_fibonacci_ote
-    SMC_MODULE_LOADED = True
-    print("[INFO] SMC Analysis module loaded successfully")
-except ImportError:
-    SMC_MODULE_LOADED = False
-    print("[WARNING] smc_analysis module not found - using legacy SMC functions")
+  pip install -r requirements.txt
+  python server.py
+
+Endpoints:
+  GET  /health
+  GET  /getAccountHealth
+  GET  /getPrice?symbol=XAUUSD
+  GET  /getCandles?symbol=XAUUSD&timeframe=M5&count=100
+  GET  /getAnalysis?symbol=XAUUSD&timeframe=M5
+  POST /placeOrder
+  POST /placeTrades
+  GET  /getPositions
+  POST /closePositions
+  POST /modifyPosition
+  POST /trailPosition_MODE1
+  POST /trailPosition_MODE2
+  POST /trail/stop
+  GET  /trail/status
+  POST /placeGrid
+  POST /gridGuard/start   — monitor floating profit, auto-close basket at target
+  POST /gridGuard/stop
+  GET  /gridGuard/status
+  POST /basketTp/start    — auto TP+SL on all basket positions (+$ / -$ targets)
+  POST /basketTp/stop
+  GET  /basketTp/status
+  POST /basketTp/apply      — one-shot TP recalc
+"""
+from __future__ import annotations
+
+import os
+import threading
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from functools import wraps
+from typing import Any, Callable
+
+import MetaTrader5 as mt5
+from flask import Flask, jsonify, request
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+API_KEY = "alphafx"
+MT5_PATH = os.environ.get("MT5_TERMINAL_PATH", "")
+HOST = "0.0.0.0"
+PORT = 8080
+DEFAULT_MAGIC = int(os.environ.get("MT5_DEFAULT_MAGIC", "202611"))
+TRAIL_POLL_MS = int(os.environ.get("TRAIL_POLL_MS", "200"))
+
+TIMEFRAMES = {
+    "M1": mt5.TIMEFRAME_M1,
+    "M2": mt5.TIMEFRAME_M2,
+    "M3": mt5.TIMEFRAME_M3,
+    "M4": mt5.TIMEFRAME_M4,
+    "M5": mt5.TIMEFRAME_M5,
+    "M6": mt5.TIMEFRAME_M6,
+    "M10": mt5.TIMEFRAME_M10,
+    "M12": mt5.TIMEFRAME_M12,
+    "M15": mt5.TIMEFRAME_M15,
+    "M20": mt5.TIMEFRAME_M20,
+    "M30": mt5.TIMEFRAME_M30,
+    "H1": mt5.TIMEFRAME_H1,
+    "H2": mt5.TIMEFRAME_H2,
+    "H3": mt5.TIMEFRAME_H3,
+    "H4": mt5.TIMEFRAME_H4,
+    "H6": mt5.TIMEFRAME_H6,
+    "H8": mt5.TIMEFRAME_H8,
+    "H12": mt5.TIMEFRAME_H12,
+    "D1": mt5.TIMEFRAME_D1,
+    "W1": mt5.TIMEFRAME_W1,
+    "MN1": mt5.TIMEFRAME_MN1,
+}
 
 app = Flask(__name__)
 
-# ============== Constants ==============
-TIMEFRAMES = {
-    'M1': mt5.TIMEFRAME_M1, 'M2': mt5.TIMEFRAME_M2, 'M3': mt5.TIMEFRAME_M3,
-    'M4': mt5.TIMEFRAME_M4, 'M5': mt5.TIMEFRAME_M5, 'M6': mt5.TIMEFRAME_M6,
-    'M10': mt5.TIMEFRAME_M10, 'M12': mt5.TIMEFRAME_M12, 'M15': mt5.TIMEFRAME_M15,
-    'M20': mt5.TIMEFRAME_M20, 'M30': mt5.TIMEFRAME_M30, 'H1': mt5.TIMEFRAME_H1,
-    'H2': mt5.TIMEFRAME_H2, 'H3': mt5.TIMEFRAME_H3, 'H4': mt5.TIMEFRAME_H4,
-    'H6': mt5.TIMEFRAME_H6, 'H8': mt5.TIMEFRAME_H8, 'H12': mt5.TIMEFRAME_H12,
-    'D1': mt5.TIMEFRAME_D1, 'W1': mt5.TIMEFRAME_W1, 'MN1': mt5.TIMEFRAME_MN1
-}
 
-# ============== Helpers ==============
-def err(): 
-    e = mt5.last_error()
-    return {"error_code": e[0], "error_message": e[1]}
+@app.after_request
+def add_cors_headers(response):
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-API-Key"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    return response
 
-def pos_to_dict(p):
-    return {"ticket": p.ticket, "time": datetime.fromtimestamp(p.time).isoformat(),
-            "type": "buy" if p.type == 0 else "sell", "magic": p.magic, "volume": p.volume,
-            "price_open": p.price_open, "sl": p.sl, "tp": p.tp, "price_current": p.price_current,
-            "swap": p.swap, "profit": p.profit, "symbol": p.symbol, "comment": p.comment}
 
-def deal_to_dict(d):
-    return {"ticket": d.ticket, "order": d.order, "time": datetime.fromtimestamp(d.time).isoformat(),
-            "type": d.type, "entry": d.entry, "volume": d.volume, "price": d.price,
-            "commission": d.commission, "swap": d.swap, "profit": d.profit, "symbol": d.symbol,
-            "comment": d.comment, "magic": d.magic, "reason": d.reason}
+@app.route("/", methods=["OPTIONS"])
+@app.route("/<path:path>", methods=["OPTIONS"])
+def cors_preflight(path=""):
+    return "", 204
 
-def order_to_dict(o):
-    return {"ticket": o.ticket, "time_setup": datetime.fromtimestamp(o.time_setup).isoformat(),
-            "type": o.type, "state": o.state, "volume_initial": o.volume_initial,
-            "volume_current": o.volume_current, "price_open": o.price_open, "sl": o.sl,
-            "tp": o.tp, "symbol": o.symbol, "comment": o.comment, "magic": o.magic}
 
-def result_to_dict(r):
-    if not r: return None
-    return {"retcode": r.retcode, "deal": r.deal, "order": r.order, "volume": r.volume,
-            "price": r.price, "bid": r.bid, "ask": r.ask, "comment": r.comment}
+# ---------------------------------------------------------------------------
+# MT5 helpers
+# ---------------------------------------------------------------------------
+def last_error() -> dict[str, Any]:
+    code, msg = mt5.last_error()
+    return {"error_code": code, "error_message": msg}
 
-# ============== Technical Indicators (Pure Python) ==============
-def calc_sma(data, period):
-    if len(data) < period: return []
-    return [sum(data[i-period:i])/period for i in range(period, len(data)+1)]
 
-def calc_ema(data, period):
-    if len(data) < period: return []
-    ema = [sum(data[:period])/period]
+def ensure_mt5(path: str | None = None) -> tuple[bool, str]:
+    if mt5.terminal_info() is not None:
+        return True, "already connected"
+    kwargs = {}
+    if path:
+        kwargs["path"] = path
+    if not mt5.initialize(**kwargs):
+        return False, str(mt5.last_error())
+    return True, "connected"
+
+
+def resolve_symbol(symbol: str) -> tuple[Any | None, str]:
+    sym = symbol.strip()
+    if not sym:
+        return None, symbol
+
+    info = mt5.symbol_info(sym)
+    if info is not None:
+        if not info.visible:
+            mt5.symbol_select(sym, True)
+            info = mt5.symbol_info(sym)
+        return info, sym
+
+    root = sym.split(".")[0]
+    for suffix in (".pr", ".c", ".m", ".i", ".raw", "-c", ".pro"):
+        candidate = root + suffix
+        if candidate == sym:
+            continue
+        info = mt5.symbol_info(candidate)
+        if info is not None:
+            if not info.visible:
+                mt5.symbol_select(candidate, True)
+                info = mt5.symbol_info(candidate)
+            return info, candidate
+
+    root_u = root.upper()
+    best_name = None
+    best_score = -1
+    for s in mt5.symbols_get() or []:
+        name = s.name
+        name_u = name.upper()
+        if name_u == root_u:
+            score = 100
+        elif name_u.startswith(root_u + "."):
+            score = 90 - len(name)
+        elif name_u.startswith(root_u):
+            score = 70 - len(name)
+        else:
+            continue
+        if score > best_score:
+            best_score = score
+            best_name = name
+
+    if best_name:
+        info = mt5.symbol_info(best_name)
+        if info and not info.visible:
+            mt5.symbol_select(best_name, True)
+            info = mt5.symbol_info(best_name)
+        if info:
+            return info, best_name
+
+    return None, symbol
+
+
+def resolve_basket_symbol(symbol: str, magic: int | None = None) -> tuple[Any | None, str]:
+    """Resolve broker symbol; fall back to open positions for this magic."""
+    info, sym = resolve_symbol(symbol)
+    if info is not None:
+        return info, sym
+    if magic is not None:
+        positions = get_basket_positions(None, magic)
+        if positions:
+            sym = positions[0].symbol
+            info = mt5.symbol_info(sym)
+            if info:
+                if not info.visible:
+                    mt5.symbol_select(sym, True)
+                    info = mt5.symbol_info(sym)
+                return info, sym
+    return None, symbol
+
+
+def supported_filling(symbol: str) -> int:
+    info = mt5.symbol_info(symbol)
+    if not info:
+        return mt5.ORDER_FILLING_IOC
+    mode = info.filling_mode
+    if mode & 1:
+        return mt5.ORDER_FILLING_FOK
+    if mode & 2:
+        return mt5.ORDER_FILLING_IOC
+    return mt5.ORDER_FILLING_RETURN
+
+
+def round_price(symbol: str, price: float) -> float:
+    info = mt5.symbol_info(symbol)
+    digits = info.digits if info else 5
+    return round(price, digits)
+
+
+def normalize_volume(symbol: str, volume: float) -> float:
+    info = mt5.symbol_info(symbol)
+    if not info:
+        return volume
+    step = info.volume_step or 0.01
+    vol = max(info.volume_min, min(volume, info.volume_max))
+    steps = round(vol / step)
+    return round(steps * step, 8)
+
+
+def profit_points(pos, tick=None) -> float:
+    info = mt5.symbol_info(pos.symbol)
+    if not info or info.point <= 0:
+        return 0.0
+    if tick is None:
+        tick = mt5.symbol_info_tick(pos.symbol)
+    if not tick:
+        return 0.0
+    if pos.type == mt5.ORDER_TYPE_BUY:
+        return (tick.bid - pos.price_open) / info.point
+    return (pos.price_open - tick.ask) / info.point
+
+
+def sl_price_from_entry_pts(pos, sl_pts_from_entry: float) -> float:
+    info = mt5.symbol_info(pos.symbol)
+    pt = info.point
+    if pos.type == mt5.ORDER_TYPE_BUY:
+        return round_price(pos.symbol, pos.price_open + sl_pts_from_entry * pt)
+    return round_price(pos.symbol, pos.price_open - sl_pts_from_entry * pt)
+
+
+def pos_to_dict(p) -> dict[str, Any]:
+    return {
+        "ticket": p.ticket,
+        "symbol": p.symbol,
+        "type": "buy" if p.type == mt5.ORDER_TYPE_BUY else "sell",
+        "volume": p.volume,
+        "price_open": p.price_open,
+        "price_current": p.price_current,
+        "sl": p.sl,
+        "tp": p.tp,
+        "profit": p.profit,
+        "swap": p.swap,
+        "magic": p.magic,
+        "comment": p.comment,
+    }
+
+
+def result_to_dict(r) -> dict[str, Any] | None:
+    if r is None:
+        return None
+    return {
+        "retcode": r.retcode,
+        "deal": r.deal,
+        "order": r.order,
+        "volume": r.volume,
+        "price": r.price,
+        "comment": r.comment,
+    }
+
+
+def send_order(req: dict) -> tuple[bool, Any]:
+    result = mt5.order_send(req)
+    ok = result is not None and result.retcode == mt5.TRADE_RETCODE_DONE
+    return ok, result
+
+
+def build_market_request(
+    symbol: str,
+    order_type: str,
+    volume: float,
+    sl: float = 0.0,
+    tp: float = 0.0,
+    magic: int = 0,
+    comment: str = "API",
+    deviation: int = 50,
+) -> tuple[dict | None, str | None]:
+    info, sym = resolve_symbol(symbol)
+    if info is None:
+        return None, f"symbol not found: {symbol}"
+
+    tick = mt5.symbol_info_tick(sym)
+    if not tick:
+        return None, "no quote"
+
+    volume = normalize_volume(sym, volume)
+    order_type = order_type.lower()
+
+    if order_type == "buy":
+        trade_type, price = mt5.ORDER_TYPE_BUY, tick.ask
+        action = mt5.TRADE_ACTION_DEAL
+    elif order_type == "sell":
+        trade_type, price = mt5.ORDER_TYPE_SELL, tick.bid
+        action = mt5.TRADE_ACTION_DEAL
+    else:
+        return None, f"invalid market type: {order_type}"
+
+    req = {
+        "action": action,
+        "symbol": sym,
+        "volume": volume,
+        "type": trade_type,
+        "price": round_price(sym, price),
+        "sl": round_price(sym, sl) if sl else 0.0,
+        "tp": round_price(sym, tp) if tp else 0.0,
+        "deviation": deviation,
+        "magic": magic,
+        "comment": comment,
+        "type_time": mt5.ORDER_TIME_GTC,
+        "type_filling": supported_filling(sym),
+    }
+    return req, None
+
+
+def build_pending_request(
+    symbol: str,
+    order_type: str,
+    volume: float,
+    price: float,
+    sl: float = 0.0,
+    tp: float = 0.0,
+    magic: int = 0,
+    comment: str = "API",
+) -> tuple[dict | None, str | None]:
+    info, sym = resolve_symbol(symbol)
+    if info is None:
+        return None, f"symbol not found: {symbol}"
+
+    volume = normalize_volume(sym, volume)
+    order_type = order_type.lower()
+    type_map = {
+        "buy_limit": mt5.ORDER_TYPE_BUY_LIMIT,
+        "sell_limit": mt5.ORDER_TYPE_SELL_LIMIT,
+        "buy_stop": mt5.ORDER_TYPE_BUY_STOP,
+        "sell_stop": mt5.ORDER_TYPE_SELL_STOP,
+    }
+    if order_type not in type_map:
+        return None, f"invalid pending type: {order_type}"
+
+    req = {
+        "action": mt5.TRADE_ACTION_PENDING,
+        "symbol": sym,
+        "volume": volume,
+        "type": type_map[order_type],
+        "price": round_price(sym, price),
+        "sl": round_price(sym, sl) if sl else 0.0,
+        "tp": round_price(sym, tp) if tp else 0.0,
+        "magic": magic,
+        "comment": comment,
+        "type_time": mt5.ORDER_TIME_GTC,
+        "type_filling": supported_filling(sym),
+    }
+    return req, None
+
+
+def apply_points_to_prices(
+    symbol: str,
+    order_type: str,
+    entry_price: float,
+    sl_points: int | None,
+    tp_points: int | None,
+) -> tuple[float, float]:
+    info = mt5.symbol_info(symbol)
+    if not info:
+        return 0.0, 0.0
+    pt = info.point
+    sl, tp = 0.0, 0.0
+    is_buy = order_type.lower() in ("buy", "buy_limit", "buy_stop")
+    if sl_points and sl_points > 0:
+        sl = entry_price - sl_points * pt if is_buy else entry_price + sl_points * pt
+    if tp_points and tp_points > 0:
+        tp = entry_price + tp_points * pt if is_buy else entry_price - tp_points * pt
+    return round_price(symbol, sl), round_price(symbol, tp)
+
+
+def place_grid_fast(
+    symbol: str,
+    lot: float,
+    distance: int,
+    initial_distance: int,
+    orders_quantity: int,
+    incremental: bool = False,
+    magic: int = 78001,
+    anchor: float | None = None,
+) -> dict[str, Any]:
+    """Fast grid — tight OrderSend loop (AlphaFX_XAU_GridTrigger_EA style)."""
+    info, sym = resolve_symbol(symbol)
+    if info is None:
+        return {"ok": False, "error": f"symbol not found: {symbol}"}
+
+    tick = mt5.symbol_info_tick(sym)
+    if not tick:
+        return {"ok": False, "error": "no quote", **last_error()}
+
+    pt = info.point
+    min_dist = max(1, info.trade_stops_level) * pt
+    ask, bid = tick.ask, tick.bid
+    if anchor is None:
+        anchor = round_price(sym, (bid + ask) / 2.0)
+
+    filling = supported_filling(sym)
+    t0 = time.perf_counter()
+    placed = failed = skipped = 0
+    results: list[dict] = []
+
+    for i in range(1, orders_quantity + 1):
+        vol = lot * (2 ** (i - 1)) if incremental else lot
+        vol = normalize_volume(sym, vol)
+        offset_pts = initial_distance + (i - 1) * distance
+
+        buy_price = round_price(sym, anchor + offset_pts * pt)
+        if buy_price > ask + min_dist:
+            req = {
+                "action": mt5.TRADE_ACTION_PENDING,
+                "symbol": sym,
+                "volume": vol,
+                "type": mt5.ORDER_TYPE_BUY_STOP,
+                "price": buy_price,
+                "sl": 0.0,
+                "tp": 0.0,
+                "magic": magic,
+                "comment": f"GRID_B{i}",
+                "type_time": mt5.ORDER_TIME_GTC,
+                "type_filling": filling,
+            }
+            ok, res = send_order(req)
+            placed += int(ok)
+            failed += int(not ok)
+            results.append({"side": "buy_stop", "level": i, "price": buy_price, "ok": ok, "order": getattr(res, "order", None)})
+        else:
+            skipped += 1
+
+        sell_price = round_price(sym, anchor - offset_pts * pt)
+        if sell_price < bid - min_dist:
+            req = {
+                "action": mt5.TRADE_ACTION_PENDING,
+                "symbol": sym,
+                "volume": vol,
+                "type": mt5.ORDER_TYPE_SELL_STOP,
+                "price": sell_price,
+                "sl": 0.0,
+                "tp": 0.0,
+                "magic": magic,
+                "comment": f"GRID_S{i}",
+                "type_time": mt5.ORDER_TIME_GTC,
+                "type_filling": filling,
+            }
+            ok, res = send_order(req)
+            placed += int(ok)
+            failed += int(not ok)
+            results.append({"side": "sell_stop", "level": i, "price": sell_price, "ok": ok, "order": getattr(res, "order", None)})
+        else:
+            skipped += 1
+
+    return {
+        "ok": placed > 0,
+        "symbol": sym,
+        "anchor": anchor,
+        "placed": placed,
+        "failed": failed,
+        "skipped": skipped,
+        "elapsed_ms": int((time.perf_counter() - t0) * 1000),
+        "orders_quantity": orders_quantity,
+        "magic": magic,
+        "results": results,
+    }
+
+
+def get_basket_floating(symbol: str | None = None, magic: int | None = None) -> dict[str, Any]:
+    """Sum floating P/L (+ swap) for positions matching symbol and/or magic."""
+    positions = mt5.positions_get(symbol=symbol) if symbol else mt5.positions_get()
+    positions = positions or []
+    if magic is not None:
+        positions = [p for p in positions if p.magic == int(magic)]
+
+    profit = sum(p.profit + p.swap for p in positions)
+    return {
+        "floating": round(profit, 2),
+        "positions_count": len(positions),
+        "symbol": symbol,
+        "magic": magic,
+    }
+
+
+def cancel_pending_orders(symbol: str | None = None, magic: int | None = None) -> dict[str, Any]:
+    orders = mt5.orders_get(symbol=symbol) if symbol else mt5.orders_get()
+    orders = orders or []
+    if magic is not None:
+        orders = [o for o in orders if o.magic == int(magic)]
+
+    cancelled = failed = 0
+    results = []
+    for o in orders:
+        req = {"action": mt5.TRADE_ACTION_REMOVE, "order": o.ticket}
+        ok, res = send_order(req)
+        if ok:
+            cancelled += 1
+        else:
+            failed += 1
+        results.append({"ticket": o.ticket, "ok": ok})
+
+    return {"cancelled": cancelled, "failed": failed, "total": len(orders), "results": results}
+
+
+def close_basket(symbol: str | None = None, magic: int | None = None, comment: str = "Grid guard close") -> dict[str, Any]:
+    """Close all matching positions and cancel pending orders (grid basket exit)."""
+    positions = mt5.positions_get(symbol=symbol) if symbol else mt5.positions_get()
+    positions = positions or []
+    if magic is not None:
+        positions = [p for p in positions if p.magic == int(magic)]
+
+    closed = failed = 0
+    pos_results = []
+    for pos in positions:
+        tick = mt5.symbol_info_tick(pos.symbol)
+        if not tick:
+            pos_results.append({"ticket": pos.ticket, "ok": False, "error": "no tick"})
+            failed += 1
+            continue
+        close_type = mt5.ORDER_TYPE_SELL if pos.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
+        close_price = tick.bid if pos.type == mt5.ORDER_TYPE_BUY else tick.ask
+        req = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": pos.symbol,
+            "volume": pos.volume,
+            "type": close_type,
+            "position": pos.ticket,
+            "price": close_price,
+            "deviation": 50,
+            "comment": comment,
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": supported_filling(pos.symbol),
+        }
+        ok, res = send_order(req)
+        if ok:
+            closed += 1
+        else:
+            failed += 1
+        pos_results.append({"ticket": pos.ticket, "ok": ok, "result": result_to_dict(res)})
+
+    order_result = cancel_pending_orders(symbol, magic)
+    return {
+        "ok": True,
+        "closed_positions": closed,
+        "failed_positions": failed,
+        "cancelled_orders": order_result["cancelled"],
+        "positions": pos_results,
+        "orders": order_result,
+    }
+
+
+def get_basket_positions(symbol: str | None = None, magic: int | None = None) -> list:
+    if magic is not None:
+        positions = [p for p in (mt5.positions_get() or []) if p.magic == int(magic)]
+        if not symbol:
+            return positions
+        _, sym = resolve_symbol(symbol)
+        if sym:
+            exact = [p for p in positions if p.symbol == sym]
+            if exact:
+                return exact
+        exact = [p for p in positions if p.symbol == symbol]
+        if exact:
+            return exact
+        root = symbol.split(".")[0].upper()
+        prefixed = [p for p in positions if p.symbol.upper().startswith(root)]
+        return prefixed or positions
+
+    positions = mt5.positions_get(symbol=symbol) if symbol else mt5.positions_get()
+    positions = list(positions or [])
+    return positions
+
+
+def position_profit_at_price(pos, close_price: float) -> float:
+    action = mt5.ORDER_TYPE_BUY if pos.type == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_SELL
+    profit = mt5.order_calc_profit(action, pos.symbol, pos.volume, pos.price_open, close_price)
+    if profit is None:
+        return 0.0
+    return float(profit) + pos.swap
+
+
+def basket_profit_at_price(positions: list, close_price: float) -> float:
+    return sum(position_profit_at_price(p, close_price) for p in positions)
+
+
+def find_price_for_basket_profit(
+    positions: list,
+    target_profit: float,
+    price_min: float,
+    price_max: float,
+    tolerance: float = 0.05,
+) -> float | None:
+    """Binary-search price where basket P/L equals target (linear in price for one symbol)."""
+    if not positions:
+        return None
+    sym = positions[0].symbol
+    lo, hi = price_min, price_max
+    p_lo = basket_profit_at_price(positions, lo)
+    p_hi = basket_profit_at_price(positions, hi)
+    if target_profit < min(p_lo, p_hi) - tolerance or target_profit > max(p_lo, p_hi) + tolerance:
+        return None
+
+    for _ in range(80):
+        mid = round_price(sym, (lo + hi) / 2.0)
+        p_mid = basket_profit_at_price(positions, mid)
+        if abs(p_mid - target_profit) <= tolerance:
+            return mid
+        if p_lo <= p_hi:
+            if p_mid < target_profit:
+                lo, p_lo = mid, p_mid
+            else:
+                hi, p_hi = mid, p_mid
+        else:
+            if p_mid > target_profit:
+                lo, p_lo = mid, p_mid
+            else:
+                hi, p_hi = mid, p_mid
+    return round_price(sym, (lo + hi) / 2.0)
+
+
+def calc_basket_sltp_levels(
+    positions: list,
+    target_profit: float,
+    target_loss: float | None = None,
+    search_points: int = 200000,
+) -> dict[str, Any]:
+    """
+    Buy TP / sell SL = price above market where basket P/L = +target_profit.
+    Sell TP / buy SL = price below market where basket P/L = +target_profit.
+    Buy SL / sell SL (loss side) = prices where basket P/L = -target_loss.
+    """
+    if not positions:
+        return {"ok": False, "error": "no positions"}
+
+    loss_target = target_loss if target_loss and target_loss > 0 else target_profit
+
+    sym = positions[0].symbol
+    info = mt5.symbol_info(sym)
+    tick = mt5.symbol_info_tick(sym)
+    if not info or not tick:
+        return {"ok": False, "error": "no symbol info"}
+
+    pt = info.point
+    mid = (tick.bid + tick.ask) / 2.0
+    min_dist = max(1, info.trade_stops_level) * pt
+    range_px = search_points * pt
+
+    buy_tp = find_price_for_basket_profit(positions, target_profit, mid, mid + range_px)
+    sell_tp = find_price_for_basket_profit(positions, target_profit, mid - range_px, mid)
+    buy_sl = find_price_for_basket_profit(positions, -loss_target, mid - range_px, mid)
+    sell_sl = find_price_for_basket_profit(positions, -loss_target, mid, mid + range_px)
+
+    buys = [p for p in positions if p.type == mt5.POSITION_TYPE_BUY]
+    sells = [p for p in positions if p.type == mt5.POSITION_TYPE_SELL]
+
+    if buy_tp is not None and buy_tp < tick.ask + min_dist:
+        buy_tp = None
+    if sell_tp is not None and sell_tp > tick.bid - min_dist:
+        sell_tp = None
+    if buy_sl is not None and buy_sl > tick.bid - min_dist:
+        buy_sl = None
+    if sell_sl is not None and sell_sl < tick.ask + min_dist:
+        sell_sl = None
+
+    return {
+        "ok": True,
+        "symbol": sym,
+        "target_profit": target_profit,
+        "target_loss": loss_target,
+        "current_floating": round(basket_profit_at_price(positions, mid), 2),
+        "bid": tick.bid,
+        "ask": tick.ask,
+        "buy_tp_price": buy_tp,
+        "sell_tp_price": sell_tp,
+        "buy_sl_price": buy_sl,
+        "sell_sl_price": sell_sl,
+        "buy_positions": len(buys),
+        "sell_positions": len(sells),
+    }
+
+
+def calc_basket_tp_levels(positions: list, target_profit: float, search_points: int = 200000) -> dict[str, Any]:
+    return calc_basket_sltp_levels(positions, target_profit, target_profit, search_points)
+
+
+def modify_position_sltp(
+    pos,
+    sl: float | None = None,
+    tp: float | None = None,
+    *,
+    update_sl: bool = True,
+    update_tp: bool = True,
+) -> tuple[bool, Any]:
+    new_sl = round_price(pos.symbol, sl) if (update_sl and sl is not None) else (pos.sl or 0.0)
+    new_tp = round_price(pos.symbol, tp) if (update_tp and tp is not None) else (pos.tp or 0.0)
+    ok, result = send_order({
+        "action": mt5.TRADE_ACTION_SLTP,
+        "symbol": pos.symbol,
+        "position": pos.ticket,
+        "sl": new_sl,
+        "tp": new_tp,
+    })
+    return ok, result
+
+
+def apply_basket_sltp(
+    symbol: str,
+    magic: int,
+    target_profit: float,
+    target_loss: float | None = None,
+    price_tolerance: float = 0.0,
+) -> dict[str, Any]:
+    """Set buy/sell TP+SL so basket hits +target_profit or -target_loss at those prices."""
+    positions = get_basket_positions(symbol, magic)
+    if not positions:
+        return {"ok": False, "error": "no positions", "modified": 0}
+
+    levels = calc_basket_sltp_levels(positions, target_profit, target_loss)
+    if not levels.get("ok"):
+        return levels
+
+    buy_tp = levels.get("buy_tp_price")
+    sell_tp = levels.get("sell_tp_price")
+    buy_sl = levels.get("buy_sl_price")
+    sell_sl = levels.get("sell_sl_price")
+    modified = failed = 0
+    results: list[dict[str, Any]] = []
+
+    for pos in positions:
+        is_buy = pos.type == mt5.POSITION_TYPE_BUY
+        desired_tp = buy_tp if is_buy else sell_tp
+        desired_sl = buy_sl if is_buy else sell_sl
+
+        if desired_tp is None and desired_sl is None:
+            results.append({"ticket": pos.ticket, "ok": False, "skipped": True, "reason": "no sl/tp level"})
+            continue
+
+        cur_tp = pos.tp or 0.0
+        cur_sl = pos.sl or 0.0
+        tp_ok = desired_tp is None or (
+            price_tolerance > 0 and cur_tp > 0 and abs(cur_tp - desired_tp) <= price_tolerance
+        )
+        sl_ok = desired_sl is None or (
+            price_tolerance > 0 and cur_sl > 0 and abs(cur_sl - desired_sl) <= price_tolerance
+        )
+        if tp_ok and sl_ok:
+            results.append({
+                "ticket": pos.ticket,
+                "ok": True,
+                "skipped": True,
+                "tp": cur_tp,
+                "sl": cur_sl,
+            })
+            continue
+
+        ok, res = modify_position_sltp(
+            pos,
+            sl=desired_sl,
+            tp=desired_tp,
+            update_sl=desired_sl is not None,
+            update_tp=desired_tp is not None,
+        )
+        modified += int(ok)
+        failed += int(not ok)
+        results.append({
+            "ticket": pos.ticket,
+            "type": "buy" if is_buy else "sell",
+            "ok": ok,
+            "tp": desired_tp,
+            "sl": desired_sl,
+            "result": result_to_dict(res),
+        })
+
+    return {
+        "ok": modified > 0 or any(
+            levels.get(k) is not None
+            for k in ("buy_tp_price", "sell_tp_price", "buy_sl_price", "sell_sl_price")
+        ),
+        "modified": modified,
+        "failed": failed,
+        "buy_tp_price": buy_tp,
+        "sell_tp_price": sell_tp,
+        "buy_sl_price": buy_sl,
+        "sell_sl_price": sell_sl,
+        "target_profit": target_profit,
+        "target_loss": levels.get("target_loss"),
+        "current_floating": levels.get("current_floating"),
+        "positions": results,
+    }
+
+
+def apply_basket_tps(
+    symbol: str,
+    magic: int,
+    target_profit: float,
+    tp_tolerance: float = 0.0,
+) -> dict[str, Any]:
+    return apply_basket_sltp(symbol, magic, target_profit, target_profit, tp_tolerance)
+def build_account_health() -> dict[str, Any]:
+    """Full account + terminal health snapshot."""
+    ok, msg = ensure_mt5(MT5_PATH or None)
+    if not ok:
+        return {"ok": False, "connected": False, "error": msg}
+
+    account = mt5.account_info()
+    terminal = mt5.terminal_info()
+    if account is None:
+        return {"ok": False, "connected": False, "error": "no account info"}
+
+    positions = mt5.positions_get() or []
+    orders = mt5.orders_get() or []
+
+    floating_profit = sum(p.profit + p.swap for p in positions)
+    floating_swap = sum(p.swap for p in positions)
+
+    # Today's closed P/L from deals
+    today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    deals = mt5.history_deals_get(today_start, datetime.now() + timedelta(days=1)) or []
+    closed_today = sum(d.profit + d.commission + d.swap for d in deals if d.entry == mt5.DEAL_ENTRY_OUT)
+
+    balance = account.balance
+    equity = account.equity
+    drawdown_usd = balance - equity if balance > equity else 0.0
+    drawdown_pct = (drawdown_usd / balance * 100.0) if balance > 0 else 0.0
+    margin_level = account.margin_level if account.margin > 0 else None
+
+    health_status = "healthy"
+    warnings: list[str] = []
+    if not terminal or not terminal.connected:
+        health_status = "disconnected"
+        warnings.append("terminal not connected to broker")
+    if not account.trade_allowed:
+        health_status = "restricted"
+        warnings.append("trading not allowed on this account")
+    if margin_level is not None and margin_level < 150:
+        health_status = "warning"
+        warnings.append(f"low margin level: {margin_level:.1f}%")
+    if drawdown_pct > 10:
+        health_status = "warning"
+        warnings.append(f"drawdown {drawdown_pct:.1f}%")
+
+    return {
+        "ok": True,
+        "connected": bool(terminal and terminal.connected),
+        "health_status": health_status,
+        "warnings": warnings,
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "account": {
+            "login": account.login,
+            "server": account.server,
+            "name": account.name,
+            "currency": account.currency,
+            "leverage": account.leverage,
+            "trade_mode": account.trade_mode,
+            "trade_allowed": account.trade_allowed,
+            "trade_expert": account.trade_expert,
+        },
+        "balance": {
+            "balance": round(balance, 2),
+            "equity": round(equity, 2),
+            "margin": round(account.margin, 2),
+            "free_margin": round(account.margin_free, 2),
+            "margin_level": round(margin_level, 2) if margin_level else None,
+            "profit": round(account.profit, 2),
+            "credit": round(account.credit, 2),
+        },
+        "drawdown": {
+            "usd": round(drawdown_usd, 2),
+            "percent": round(drawdown_pct, 2),
+        },
+        "floating": {
+            "positions_count": len(positions),
+            "orders_count": len(orders),
+            "profit": round(floating_profit, 2),
+            "swap": round(floating_swap, 2),
+        },
+        "today": {
+            "closed_pl": round(closed_today, 2),
+            "deals_count": len(deals),
+        },
+        "terminal": {
+            "company": terminal.company if terminal else None,
+            "name": terminal.name if terminal else None,
+            "build": terminal.build if terminal else None,
+            "connected": terminal.connected if terminal else False,
+            "trade_allowed": terminal.trade_allowed if terminal else False,
+        },
+        "trail_jobs": len(trail_mgr.status()),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Trailing manager
+# ---------------------------------------------------------------------------
+@dataclass
+class TrailJob:
+    ticket: int
+    mode: int
+    step_points: int
+    active: bool = True
+    last_sl_pts: float | None = None
+    meta: dict[str, Any] = field(default_factory=dict)
+
+
+class TrailingManager:
+    def __init__(self, poll_ms: int = 200):
+        self._jobs: dict[int, TrailJob] = {}
+        self._lock = threading.Lock()
+        self._poll_ms = poll_ms
+        self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._loop, daemon=True, name="trail-manager")
+        self._thread.start()
+
+    def add_mode1(self, ticket: int, trail_points: int) -> dict[str, Any]:
+        return self._add(ticket, mode=1, step_points=trail_points)
+
+    def add_mode2(self, ticket: int, step_points: int) -> dict[str, Any]:
+        return self._add(ticket, mode=2, step_points=step_points)
+
+    def remove(self, ticket: int) -> bool:
+        with self._lock:
+            job = self._jobs.pop(int(ticket), None)
+        return job is not None
+
+    def status(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [
+                {
+                    "ticket": j.ticket,
+                    "mode": j.mode,
+                    "step_points": j.step_points,
+                    "active": j.active,
+                    "last_sl_pts": j.last_sl_pts,
+                }
+                for j in self._jobs.values()
+            ]
+
+    def _add(self, ticket: int, mode: int, step_points: int) -> dict[str, Any]:
+        positions = mt5.positions_get(ticket=int(ticket))
+        if not positions:
+            return {"ok": False, "error": "position not found", "ticket": ticket}
+
+        pos = positions[0]
+        step_points = max(1, int(step_points))
+        job = TrailJob(ticket=int(ticket), mode=mode, step_points=step_points)
+
+        if mode == 2:
+            init_sl_pts = -step_points
+            new_sl = sl_price_from_entry_pts(pos, init_sl_pts)
+            ok = self._modify_sl(pos, new_sl)
+            job.last_sl_pts = init_sl_pts
+            with self._lock:
+                self._jobs[job.ticket] = job
+            self.start()
+            return {
+                "ok": ok,
+                "ticket": ticket,
+                "mode": 2,
+                "step_points": step_points,
+                "initial_sl_pts_from_entry": init_sl_pts,
+                "sl": new_sl,
+            }
+
+        with self._lock:
+            self._jobs[job.ticket] = job
+        self.start()
+        self._tick_job(job)
+        return {"ok": True, "ticket": ticket, "mode": 1, "trail_points": step_points, "sl": pos.sl}
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            with self._lock:
+                tickets = list(self._jobs.keys())
+            for ticket in tickets:
+                with self._lock:
+                    job = self._jobs.get(ticket)
+                if job and job.active:
+                    self._tick_job(job)
+            time.sleep(self._poll_ms / 1000.0)
+
+    def _tick_job(self, job: TrailJob) -> None:
+        positions = mt5.positions_get(ticket=job.ticket)
+        if not positions:
+            with self._lock:
+                self._jobs.pop(job.ticket, None)
+            return
+
+        pos = positions[0]
+        pts = profit_points(pos)
+        step = job.step_points
+
+        if job.mode == 1:
+            locked_pts = pts - step
+            if locked_pts < -step:
+                return
+        else:
+            buckets = int(pts // step)
+            locked_pts = step * (buckets - 1)
+
+        if job.last_sl_pts is not None and locked_pts <= job.last_sl_pts:
+            return
+
+        new_sl = sl_price_from_entry_pts(pos, locked_pts)
+        if not self._is_better_sl(pos, new_sl):
+            return
+
+        if self._modify_sl(pos, new_sl):
+            job.last_sl_pts = locked_pts
+
+    def _is_better_sl(self, pos, new_sl: float) -> bool:
+        if pos.sl <= 0:
+            return True
+        if pos.type == mt5.ORDER_TYPE_BUY:
+            return new_sl > pos.sl
+        return new_sl < pos.sl
+
+    def _modify_sl(self, pos, new_sl: float) -> bool:
+        new_sl = round_price(pos.symbol, new_sl)
+        req = {
+            "action": mt5.TRADE_ACTION_SLTP,
+            "symbol": pos.symbol,
+            "position": pos.ticket,
+            "sl": new_sl,
+            "tp": pos.tp,
+        }
+        result = mt5.order_send(req)
+        return result is not None and result.retcode == mt5.TRADE_RETCODE_DONE
+
+
+trail_mgr = TrailingManager(poll_ms=TRAIL_POLL_MS)
+
+
+# ---------------------------------------------------------------------------
+# Grid basket guard — auto-close on floating profit target
+# ---------------------------------------------------------------------------
+@dataclass
+class GridGuardJob:
+    key: str
+    symbol: str
+    magic: int
+    max_floating_profit: float  # close when floating >= this (e.g. 2 = +$2)
+    active: bool = True
+    triggered: bool = False
+    last_floating: float = 0.0
+
+
+class GridGuardManager:
+    def __init__(self, poll_ms: int = 500):
+        self._jobs: dict[str, GridGuardJob] = {}
+        self._lock = threading.Lock()
+        self._poll_ms = poll_ms
+        self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._loop, daemon=True, name="grid-guard")
+        self._thread.start()
+
+    def _job_key(self, symbol: str, magic: int) -> str:
+        return f"{symbol}:{magic}"
+
+    def add(
+        self,
+        symbol: str,
+        magic: int,
+        max_floating_profit: float,
+    ) -> dict[str, Any]:
+        if max_floating_profit <= 0:
+            return {"ok": False, "error": "max_floating_profit must be > 0"}
+
+        info, sym = resolve_symbol(symbol)
+        if info is None:
+            return {"ok": False, "error": f"symbol not found: {symbol}"}
+
+        key = self._job_key(sym, int(magic))
+        job = GridGuardJob(
+            key=key,
+            symbol=sym,
+            magic=int(magic),
+            max_floating_profit=float(max_floating_profit),
+        )
+        with self._lock:
+            self._jobs[key] = job
+        self.start()
+        snap = get_basket_floating(sym, job.magic)
+        job.last_floating = snap["floating"]
+        return {
+            "ok": True,
+            "symbol": sym,
+            "magic": job.magic,
+            "max_floating_profit": job.max_floating_profit,
+            "current_floating": snap["floating"],
+            "message": f"Guard active: close basket if floating >= +{job.max_floating_profit}",
+        }
+
+    def remove(self, symbol: str | None = None, magic: int | None = None) -> int:
+        removed = 0
+        with self._lock:
+            if symbol is not None and magic is not None:
+                _, sym = resolve_symbol(symbol)
+                key = self._job_key(sym or symbol, int(magic))
+                if self._jobs.pop(key, None):
+                    removed = 1
+            else:
+                removed = len(self._jobs)
+                self._jobs.clear()
+        return removed
+
+    def status(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [
+                {
+                    "symbol": j.symbol,
+                    "magic": j.magic,
+                    "active": j.active,
+                    "triggered": j.triggered,
+                    "max_floating_profit": j.max_floating_profit,
+                    "last_floating": j.last_floating,
+                }
+                for j in self._jobs.values()
+            ]
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            with self._lock:
+                keys = list(self._jobs.keys())
+            for key in keys:
+                with self._lock:
+                    job = self._jobs.get(key)
+                if job and job.active and not job.triggered:
+                    self._tick(job)
+            time.sleep(self._poll_ms / 1000.0)
+
+    def _tick(self, job: GridGuardJob) -> None:
+        snap = get_basket_floating(job.symbol, job.magic)
+        floating = snap["floating"]
+        job.last_floating = floating
+
+        if floating < job.max_floating_profit:
+            return
+
+        print(f"[GridGuard] floating profit hit: {job.symbol} magic={job.magic} floating=${floating}")
+        close_basket(job.symbol, job.magic, comment="GridGuard floating_profit")
+        job.triggered = True
+        job.active = False
+        with self._lock:
+            self._jobs.pop(job.key, None)
+
+
+grid_guard = GridGuardManager(poll_ms=500)
+
+
+# ---------------------------------------------------------------------------
+# Basket SL/TP manager — dynamic per-position TP+SL for basket profit/loss targets
+# ---------------------------------------------------------------------------
+@dataclass
+class BasketTpJob:
+    key: str
+    symbol: str
+    magic: int
+    target_profit: float
+    target_loss: float
+    active: bool = True
+    last_position_count: int = 0
+    buy_tp_price: float | None = None
+    sell_tp_price: float | None = None
+    buy_sl_price: float | None = None
+    sell_sl_price: float | None = None
+    last_floating: float = 0.0
+    last_modified: int = 0
+
+
+class BasketTpManager:
+    def __init__(self, poll_ms: int = 1000):
+        self._jobs: dict[str, BasketTpJob] = {}
+        self._lock = threading.Lock()
+        self._poll_ms = poll_ms
+        self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._loop, daemon=True, name="basket-tp")
+        self._thread.start()
+
+    def _job_key(self, symbol: str, magic: int) -> str:
+        return f"{symbol}:{magic}"
+
+    def add(
+        self,
+        symbol: str,
+        magic: int,
+        target_profit: float,
+        target_loss: float | None = None,
+    ) -> dict[str, Any]:
+        if target_profit <= 0:
+            return {"ok": False, "error": "target_profit must be > 0"}
+
+        loss = float(target_loss) if target_loss and target_loss > 0 else float(target_profit)
+
+        info, sym = resolve_basket_symbol(symbol, magic)
+        if info is None:
+            return {"ok": False, "error": f"symbol not found: {symbol}"}
+
+        key = self._job_key(sym, int(magic))
+        job = BasketTpJob(
+            key=key,
+            symbol=sym,
+            magic=int(magic),
+            target_profit=float(target_profit),
+            target_loss=loss,
+        )
+        positions = get_basket_positions(sym, job.magic)
+        job.last_position_count = len(positions)
+
+        with self._lock:
+            self._jobs[key] = job
+        self.start()
+
+        apply_result = (
+            apply_basket_sltp(sym, job.magic, job.target_profit, job.target_loss)
+            if positions
+            else {"ok": True, "modified": 0, "message": "waiting for positions"}
+        )
+        levels = calc_basket_sltp_levels(
+            get_basket_positions(sym, job.magic), job.target_profit, job.target_loss
+        )
+        job.buy_tp_price = levels.get("buy_tp_price")
+        job.sell_tp_price = levels.get("sell_tp_price")
+        job.buy_sl_price = levels.get("buy_sl_price")
+        job.sell_sl_price = levels.get("sell_sl_price")
+        job.last_floating = levels.get("current_floating", 0.0)
+
+        return {
+            "ok": True,
+            "symbol": sym,
+            "magic": job.magic,
+            "target_profit": job.target_profit,
+            "target_loss": job.target_loss,
+            "buy_tp_price": job.buy_tp_price,
+            "sell_tp_price": job.sell_tp_price,
+            "buy_sl_price": job.buy_sl_price,
+            "sell_sl_price": job.sell_sl_price,
+            "current_floating": job.last_floating,
+            "apply": apply_result,
+            "message": (
+                f"Basket SL/TP active: +${job.target_profit} / -${job.target_loss} | "
+                f"buy TP={job.buy_tp_price} SL={job.buy_sl_price} | "
+                f"sell TP={job.sell_tp_price} SL={job.sell_sl_price}"
+            ),
+        }
+
+    def remove(self, symbol: str | None = None, magic: int | None = None) -> int:
+        removed = 0
+        with self._lock:
+            if symbol is not None and magic is not None:
+                _, sym = resolve_symbol(symbol)
+                key = self._job_key(sym or symbol, int(magic))
+                if self._jobs.pop(key, None):
+                    removed = 1
+            else:
+                removed = len(self._jobs)
+                self._jobs.clear()
+        return removed
+
+    def status(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [
+                {
+                    "symbol": j.symbol,
+                    "magic": j.magic,
+                    "active": j.active,
+                    "target_profit": j.target_profit,
+                    "target_loss": j.target_loss,
+                    "buy_tp_price": j.buy_tp_price,
+                    "sell_tp_price": j.sell_tp_price,
+                    "buy_sl_price": j.buy_sl_price,
+                    "sell_sl_price": j.sell_sl_price,
+                    "last_floating": j.last_floating,
+                    "last_position_count": j.last_position_count,
+                    "last_modified": j.last_modified,
+                }
+                for j in self._jobs.values()
+            ]
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            with self._lock:
+                keys = list(self._jobs.keys())
+            for key in keys:
+                with self._lock:
+                    job = self._jobs.get(key)
+                if job and job.active:
+                    self._tick(job)
+            time.sleep(self._poll_ms / 1000.0)
+
+    def _tick(self, job: BasketTpJob) -> None:
+        positions = get_basket_positions(job.symbol, job.magic)
+        count = len(positions)
+
+        if count == 0:
+            with self._lock:
+                self._jobs.pop(job.key, None)
+            return
+
+        snap = get_basket_floating(job.symbol, job.magic)
+        floating = snap["floating"]
+        job.last_floating = floating
+
+        if floating >= job.target_profit:
+            print(f"[BasketSLTP] profit target hit: {job.symbol} magic={job.magic} floating=${floating}")
+            close_basket(job.symbol, job.magic, comment="BasketSLTP profit")
+            with self._lock:
+                self._jobs.pop(job.key, None)
+            return
+
+        if floating <= -job.target_loss:
+            print(f"[BasketSLTP] loss target hit: {job.symbol} magic={job.magic} floating=${floating}")
+            close_basket(job.symbol, job.magic, comment="BasketSLTP loss")
+            with self._lock:
+                self._jobs.pop(job.key, None)
+            return
+
+        if job.last_position_count > 0 and count < job.last_position_count:
+            print(f"[BasketSLTP] partial SL/TP hit, closing remainder: {job.symbol} magic={job.magic}")
+            close_basket(job.symbol, job.magic, comment="BasketSLTP partial")
+            with self._lock:
+                self._jobs.pop(job.key, None)
+            return
+
+        job.last_position_count = count
+
+        info = mt5.symbol_info(job.symbol)
+        pt = info.point if info else 0.01
+        apply_result = apply_basket_sltp(
+            job.symbol, job.magic, job.target_profit, job.target_loss, price_tolerance=pt * 2
+        )
+        job.last_modified = apply_result.get("modified", 0)
+
+        levels = calc_basket_sltp_levels(positions, job.target_profit, job.target_loss)
+        if levels.get("ok"):
+            job.buy_tp_price = levels.get("buy_tp_price")
+            job.sell_tp_price = levels.get("sell_tp_price")
+            job.buy_sl_price = levels.get("buy_sl_price")
+            job.sell_sl_price = levels.get("sell_sl_price")
+
+
+basket_tp_mgr = BasketTpManager(poll_ms=1000)
+
+
+# ---------------------------------------------------------------------------
+# Auth / helpers
+# ---------------------------------------------------------------------------
+def require_api_key(fn: Callable) -> Callable:
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        if API_KEY:
+            key = request.headers.get("X-API-Key") or request.args.get("api_key")
+            if key != API_KEY:
+                return jsonify({"ok": False, "error": "unauthorized"}), 401
+        return fn(*args, **kwargs)
+    return wrapper
+
+
+def require_mt5(fn: Callable) -> Callable:
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        ok, msg = ensure_mt5(MT5_PATH or None)
+        if not ok:
+            return jsonify({"ok": False, "error": "mt5 not connected", "detail": msg}), 503
+        return fn(*args, **kwargs)
+    return wrapper
+
+
+def json_body() -> dict[str, Any]:
+    return request.get_json(silent=True) or {}
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+@app.route("/health", methods=["GET"])
+def health():
+    ok, msg = ensure_mt5(MT5_PATH or None)
+    account = mt5.account_info() if ok else None
+    return jsonify({
+        "ok": ok,
+        "service": "mt5-vps-trade-api",
+        "version": "1.3.0",
+        "mt5": msg,
+        "account": account.login if account else None,
+        "server": account.server if account else None,
+        "trail_jobs": len(trail_mgr.status()),
+    })
+
+
+@app.route("/getAccountHealth", methods=["GET"])
+@require_api_key
+def get_account_health():
+    """Full account health: balance, equity, margin, drawdown, floating P/L, today's closed P/L."""
+    payload = build_account_health()
+    status = 200 if payload.get("ok") else 503
+    return jsonify(payload), status
+
+
+@app.route("/getPrice", methods=["GET"])
+@require_api_key
+@require_mt5
+def get_price():
+    """Live bid/ask for a symbol. ?symbol=XAUUSD"""
+    symbol = request.args.get("symbol", "").strip()
+    if not symbol:
+        return jsonify({"ok": False, "error": "symbol query param required"}), 400
+
+    info, sym = resolve_symbol(symbol)
+    if info is None:
+        return jsonify({"ok": False, "error": f"symbol not found: {symbol}"}), 404
+
+    tick = mt5.symbol_info_tick(sym)
+    if tick is None:
+        return jsonify({"ok": False, "error": "no quote", **last_error()}), 400
+
+    pt = info.point or 0.00001
+    spread_pts = round((tick.ask - tick.bid) / pt, 1) if pt > 0 else 0
+
+    return jsonify({
+        "ok": True,
+        "symbol": sym,
+        "bid": tick.bid,
+        "ask": tick.ask,
+        "last": tick.last,
+        "spread_points": spread_pts,
+        "spread": round(tick.ask - tick.bid, info.digits),
+        "time": datetime.utcfromtimestamp(tick.time).isoformat() + "Z",
+        "digits": info.digits,
+        "point": info.point,
+    })
+
+
+@app.route("/getCandles", methods=["GET"])
+@require_api_key
+@require_mt5
+def get_candles():
+    """
+    OHLCV candles from MT5.
+    ?symbol=XAUUSD&timeframe=M5&count=100
+    count max 5000
+    """
+    symbol = request.args.get("symbol", "").strip()
+    if not symbol:
+        return jsonify({"ok": False, "error": "symbol query param required"}), 400
+
+    tf_str = request.args.get("timeframe", "M5").upper()
+    timeframe = TIMEFRAMES.get(tf_str)
+    if timeframe is None:
+        return jsonify({"ok": False, "error": f"invalid timeframe: {tf_str}", "allowed": list(TIMEFRAMES.keys())}), 400
+
+    count = int(request.args.get("count", 100))
+    count = max(1, min(count, 5000))
+
+    info, sym = resolve_symbol(symbol)
+    if info is None:
+        return jsonify({"ok": False, "error": f"symbol not found: {symbol}"}), 404
+
+    rates = mt5.copy_rates_from_pos(sym, timeframe, 0, count)
+    if rates is None or len(rates) == 0:
+        return jsonify({"ok": False, "error": "no candle data", **last_error()}), 400
+
+    candles = []
+    for r in rates:
+        candles.append({
+            "time": datetime.utcfromtimestamp(int(r["time"])).isoformat() + "Z",
+            "open": float(r["open"]),
+            "high": float(r["high"]),
+            "low": float(r["low"]),
+            "close": float(r["close"]),
+            "tick_volume": int(r["tick_volume"]),
+            "spread": int(r["spread"]) if "spread" in r.dtype.names else 0,
+            "real_volume": int(r["real_volume"]) if "real_volume" in r.dtype.names else 0,
+        })
+
+    return jsonify({
+        "ok": True,
+        "symbol": sym,
+        "timeframe": tf_str,
+        "count": len(candles),
+        "first": candles[0]["time"] if candles else None,
+        "last": candles[-1]["time"] if candles else None,
+        "last_close": candles[-1]["close"] if candles else None,
+        "candles": candles,
+    })
+
+
+# ---------------------------------------------------------------------------
+# Chart analysis — trends, RSI, order blocks
+# ---------------------------------------------------------------------------
+def calc_ema(values: list[float], period: int) -> list[float]:
+    if len(values) < period:
+        return []
     k = 2 / (period + 1)
-    for i in range(period, len(data)):
-        ema.append(ema[-1] + k * (data[i] - ema[-1]))
+    ema = [sum(values[:period]) / period]
+    for v in values[period:]:
+        ema.append(v * k + ema[-1] * (1 - k))
     return ema
 
-def calc_smma(data, period):
-    if len(data) < period: return []
-    smma = [sum(data[:period])/period]
-    for i in range(period, len(data)):
-        smma.append((smma[-1] * (period - 1) + data[i]) / period)
-    return smma
 
-def calc_lwma(data, period):
-    if len(data) < period: return []
-    result = []
-    weight_sum = sum(range(1, period + 1))
-    for i in range(period - 1, len(data)):
-        weighted = sum(data[i-period+1+j] * (j+1) for j in range(period))
-        result.append(weighted / weight_sum)
-    return result
-
-def calc_rsi(data, period=14):
-    if len(data) < period + 1: return []
-    deltas = [data[i] - data[i-1] for i in range(1, len(data))]
-    gains = [d if d > 0 else 0 for d in deltas]
-    losses = [-d if d < 0 else 0 for d in deltas]
+def calc_rsi(closes: list[float], period: int = 14) -> list[float]:
+    if len(closes) < period + 1:
+        return []
+    deltas = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+    gains = [max(d, 0) for d in deltas]
+    losses = [max(-d, 0) for d in deltas]
     avg_gain = sum(gains[:period]) / period
     avg_loss = sum(losses[:period]) / period
-    rsi = []
+    rsi: list[float] = []
     for i in range(period, len(deltas)):
         avg_gain = (avg_gain * (period - 1) + gains[i]) / period
         avg_loss = (avg_loss * (period - 1) + losses[i]) / period
-        rs = avg_gain / avg_loss if avg_loss != 0 else 100
+        rs = avg_gain / avg_loss if avg_loss else 100.0
         rsi.append(100 - (100 / (1 + rs)))
     return rsi
 
-def calc_macd(data, fast=12, slow=26, signal=9):
-    if len(data) < slow + signal: return {"macd": [], "signal": [], "histogram": []}
-    ema_fast = calc_ema(data, fast)
-    ema_slow = calc_ema(data, slow)
-    diff = slow - fast
-    macd_line = [ema_fast[i] - ema_slow[i-diff] for i in range(diff, len(ema_fast))]
-    signal_line = calc_ema(macd_line, signal)
-    diff2 = len(macd_line) - len(signal_line)
-    histogram = [macd_line[i+diff2] - signal_line[i] for i in range(len(signal_line))]
-    return {"macd": macd_line[-len(signal_line):], "signal": signal_line, "histogram": histogram}
 
-def calc_bollinger(data, period=20, std_dev=2):
-    if len(data) < period: return {"upper": [], "middle": [], "lower": []}
-    middle = calc_sma(data, period)
-    upper, lower = [], []
-    for i in range(period - 1, len(data)):
-        subset = data[i-period+1:i+1]
-        mean = sum(subset) / len(subset)
-        variance = sum((x - mean) ** 2 for x in subset) / len(subset)
-        std = variance ** 0.5
-        upper.append(middle[i-period+1] + std_dev * std)
-        lower.append(middle[i-period+1] - std_dev * std)
-    return {"upper": upper, "middle": middle, "lower": lower}
-
-def calc_stochastic(high, low, close, k_period=14, d_period=3):
-    if len(close) < k_period: return {"k": [], "d": []}
-    k_values = []
-    for i in range(k_period - 1, len(close)):
-        highest = max(high[i-k_period+1:i+1])
-        lowest = min(low[i-k_period+1:i+1])
-        if highest - lowest != 0:
-            k_values.append(100 * (close[i] - lowest) / (highest - lowest))
-        else:
-            k_values.append(50.0)
-    d_values = calc_sma(k_values, d_period)
-    return {"k": k_values, "d": d_values}
-
-def calc_atr(high, low, close, period=14):
-    if len(close) < period + 1: return []
-    tr = [high[0] - low[0]]
-    for i in range(1, len(close)):
-        tr.append(max(high[i] - low[i], abs(high[i] - close[i-1]), abs(low[i] - close[i-1])))
-    return calc_smma(tr, period)
-
-def calc_cci(high, low, close, period=20):
-    if len(close) < period: return []
-    tp = [(high[i] + low[i] + close[i]) / 3 for i in range(len(close))]
-    result = []
-    for i in range(period - 1, len(tp)):
-        subset = tp[i-period+1:i+1]
-        sma = sum(subset) / len(subset)
-        mad = sum(abs(x - sma) for x in subset) / len(subset)
-        if mad != 0:
-            result.append((tp[i] - sma) / (0.015 * mad))
-        else:
-            result.append(0.0)
-    return result
-
-def calc_williams_r(high, low, close, period=14):
-    if len(close) < period: return []
-    result = []
-    for i in range(period - 1, len(close)):
-        highest = max(high[i-period+1:i+1])
-        lowest = min(low[i-period+1:i+1])
-        if highest - lowest != 0:
-            result.append(-100 * (highest - close[i]) / (highest - lowest))
-        else:
-            result.append(-50.0)
-    return result
-
-def calc_momentum(data, period=10):
-    if len(data) < period + 1: return []
-    return [data[i] - data[i-period] for i in range(period, len(data))]
-
-def calc_roc(data, period=10):
-    if len(data) < period + 1: return []
-    return [(data[i] - data[i-period]) / data[i-period] * 100 if data[i-period] != 0 else 0 for i in range(period, len(data))]
-
-# ============== Connection ==============
-# Default MT5 terminal path (adjust as needed)
-MT5_TERMINAL_PATH = r"C:\Program Files\MetaTrader 5\terminal64.exe"
-
-_INVOKE_KEYS = frozenset({
-    "ephemeral", "kill_terminal", "launch_terminal", "login", "password",
-    "server", "path", "portable", "timeout",
-})
-
-
-def _is_mt5_running():
-    import subprocess
-    try:
-        result = subprocess.run(
-            ['tasklist', '/FI', 'IMAGENAME eq terminal64.exe'],
-            capture_output=True, text=True, timeout=5,
-        )
-        return 'terminal64.exe' in result.stdout
-    except Exception:
-        return False
-
-
-def _kill_mt5_terminal():
-    import os
-    import subprocess
-    killed = False
-    try:
-        ret = os.system('taskkill /F /IM terminal64.exe >nul 2>&1')
-        if ret == 0:
-            killed = True
-        else:
-            ret2 = os.system('taskkill /F /IM terminal.exe >nul 2>&1')
-            if ret2 == 0:
-                killed = True
-    except Exception as e:
-        print(f"[MT5] os.system kill failed: {e}")
-    if not killed:
-        try:
-            proc = subprocess.run(
-                'taskkill /F /IM terminal64.exe',
-                shell=True, capture_output=True, text=True, timeout=10,
-            )
-            if proc.returncode == 0 or 'SUCCESS' in (proc.stdout or '').upper():
-                killed = True
-        except Exception as e:
-            print(f"[MT5] subprocess kill failed: {e}")
-    return killed
-
-
-def _ensure_mt5_connected(data=None):
-    """Launch terminal if needed, initialize Python API. Credentials from body or env."""
-    import os
-    import time
-
-    data = data or {}
-    launch_terminal = data.get('launch_terminal', True)
-    terminal_path = data.get('path') or os.environ.get('MT5_TERMINAL_PATH') or MT5_TERMINAL_PATH
-
-    existing = mt5.terminal_info()
-    if existing is not None:
-        acct = mt5.account_info()
-        return {
-            "success": True,
-            "terminal_launched": False,
-            "already_connected": True,
-            "account": acct.login if acct else None,
-            "server": acct.server if acct else None,
-        }
-
-    terminal_launched = False
-    if launch_terminal and not _is_mt5_running():
-        try:
-            print(f"[MT5] Launching terminal: {terminal_path}")
-            import subprocess
-            subprocess.Popen([terminal_path], shell=False)
-            terminal_launched = True
-            time.sleep(5)
-        except Exception as e:
-            return {"success": False, "terminal_launched": False, "error": f"launch failed: {e}"}
-
-    kwargs = {"timeout": int(data.get('timeout', 60000)), "portable": bool(data.get('portable', False))}
-    if data.get('path'):
-        kwargs['path'] = data['path']
-    login = data.get('login') or os.environ.get('MT5_LOGIN')
-    password = data.get('password') or os.environ.get('MT5_PASSWORD')
-    server = data.get('server') or os.environ.get('MT5_SERVER')
-    if login:
-        kwargs['login'] = int(login)
-    if password:
-        kwargs['password'] = str(password)
-    if server:
-        kwargs['server'] = str(server)
-
-    max_retries = 3 if terminal_launched else 1
-    for attempt in range(max_retries):
-        if mt5.initialize(**kwargs):
-            acct = mt5.account_info()
-            return {
-                "success": True,
-                "terminal_launched": terminal_launched,
-                "account": acct.login if acct else None,
-                "server": acct.server if acct else None,
-            }
-        if terminal_launched and attempt < max_retries - 1:
-            time.sleep(3)
-
-    e = err()
-    return {"success": False, "terminal_launched": terminal_launched, **e}
-
-
-def _disconnect_mt5(kill_terminal=True):
-    mt5.shutdown()
-    result = {"success": True, "api_disconnected": True, "terminal_killed": False}
-    if kill_terminal:
-        result["terminal_killed"] = _kill_mt5_terminal()
-        result["message"] = (
-            "MT5 terminal closed" if result["terminal_killed"]
-            else "API disconnected (terminal may still be running)"
-        )
-    else:
-        result["message"] = "API disconnected (terminal still running)"
-    return result
-
-
-def _invoke_strip(data):
-    return {k: v for k, v in data.items() if k not in _INVOKE_KEYS}
-
-
-@app.route('/api/init', methods=['POST'])
-def initialize():
-    """Initialize MT5 connection. Optionally launches MT5 terminal if not running."""
-    data = request.json or {}
-    result = _ensure_mt5_connected(data)
-    if result.get("success"):
-        return jsonify({"success": True, "message": "MT5 initialized", **result})
-    return jsonify(result), 400
-
-
-@app.route('/api/shutdown', methods=['POST'])
-def shutdown():
-    """Shutdown MT5 API connection and optionally kill the terminal"""
-    data = request.json or {}
-    kill_terminal = data.get('kill_terminal', True)
-    return jsonify(_disconnect_mt5(kill_terminal))
-
-
-@app.route('/api/invoke/trade', methods=['POST'])
-def invoke_trade():
-    """
-    One-shot trade: connect (launch terminal if needed) -> open order -> disconnect.
-    Set ephemeral=false to keep MT5 running after the call.
-    Credentials: JSON login/password/server or env MT5_LOGIN, MT5_PASSWORD, MT5_SERVER.
-    """
-    data = request.json or {}
-    ephemeral = data.get('ephemeral', True)
-    kill_terminal = data.get('kill_terminal', ephemeral)
-
-    conn = _ensure_mt5_connected(data)
-    if not conn.get("success"):
-        return jsonify({"phase": "connect", **conn}), 400
-
-    trade_body = _invoke_strip(data)
-    with app.test_request_context('/api/trade/open', method='POST', json=trade_body):
-        resp = open_trade()
-
-    payload = resp.get_json() if hasattr(resp, 'get_json') else {}
-    status_code = resp.status_code if hasattr(resp, 'status_code') else 200
-    payload["connect"] = conn
-
-    if ephemeral:
-        payload["shutdown"] = _disconnect_mt5(kill_terminal)
-
-    return jsonify(payload), status_code
-
-
-@app.route('/api/invoke/close', methods=['POST'])
-def invoke_close():
-    """One-shot close position by ticket."""
-    data = request.json or {}
-    ephemeral = data.get('ephemeral', True)
-    kill_terminal = data.get('kill_terminal', ephemeral)
-
-    conn = _ensure_mt5_connected(data)
-    if not conn.get("success"):
-        return jsonify({"phase": "connect", **conn}), 400
-
-    trade_body = _invoke_strip(data)
-    with app.test_request_context('/api/trade/close', method='POST', json=trade_body):
-        resp = close_trade()
-
-    payload = resp.get_json() if hasattr(resp, 'get_json') else {}
-    status_code = resp.status_code if hasattr(resp, 'status_code') else 200
-    payload["connect"] = conn
-
-    if ephemeral:
-        payload["shutdown"] = _disconnect_mt5(kill_terminal)
-
-    return jsonify(payload), status_code
-
-
-@app.route('/api/invoke/account', methods=['POST'])
-def invoke_account():
-    """One-shot account info (connect -> read -> disconnect)."""
-    data = request.json or {}
-    ephemeral = data.get('ephemeral', True)
-    kill_terminal = data.get('kill_terminal', ephemeral)
-
-    conn = _ensure_mt5_connected(data)
-    if not conn.get("success"):
-        return jsonify({"phase": "connect", **conn}), 400
-
-    acct = mt5.account_info()
-    payload = {
-        "success": bool(acct),
-        "connect": conn,
-        "account": acct._asdict() if acct else None,
-    }
-    if not acct:
-        payload.update(err())
-
-    if ephemeral:
-        payload["shutdown"] = _disconnect_mt5(kill_terminal)
-
-    return jsonify(payload), 200 if acct else 400
-
-@app.route('/api/status', methods=['GET'])
-def status():
-    t = mt5.terminal_info()
-    if t:
-        return jsonify({"connected": True, "build": t.build, "name": t.name, 
-                       "path": t.path, "trade_allowed": t.trade_allowed})
-    return jsonify({"connected": False, **err()})
-
-@app.route('/api/version', methods=['GET'])
-def version():
-    v = mt5.version()
-    return jsonify({"version": v[0], "build": v[1], "date": v[2]}) if v else (jsonify(err()), 400)
-
-# ============== Account ==============
-@app.route('/api/account', methods=['GET'])
-def account_info():
-    a = mt5.account_info()
-    if a:
-        return jsonify({"login": a.login, "leverage": a.leverage, "balance": a.balance,
-                       "equity": a.equity, "margin": a.margin, "margin_free": a.margin_free,
-                       "margin_level": a.margin_level, "profit": a.profit, "currency": a.currency,
-                       "server": a.server, "name": a.name, "company": a.company})
-    return jsonify(err()), 400
-
-# ============== Symbols ==============
-@app.route('/api/symbols', methods=['GET'])
-def get_symbols():
-    group = request.args.get('group')
-    symbols = mt5.symbols_get(group=group) if group else mt5.symbols_get()
-    if symbols:
-        return jsonify({"count": len(symbols), "symbols": [s.name for s in symbols]})
-    return jsonify(err()), 400
-
-@app.route('/api/symbol/<symbol>', methods=['GET'])
-def symbol_info(symbol):
-    s = mt5.symbol_info(symbol)
-    if s:
-        return jsonify({"name": s.name, "bid": s.bid, "ask": s.ask, "spread": s.spread,
-                       "digits": s.digits, "point": s.point, "volume_min": s.volume_min,
-                       "volume_max": s.volume_max, "volume_step": s.volume_step,
-                       "trade_mode": s.trade_mode, "description": s.description,
-                       "trade_stops_level": s.trade_stops_level, "trade_freeze_level": s.trade_freeze_level})
-    return jsonify({"error": f"Symbol {symbol} not found"}), 404
-
-@app.route('/api/symbol/<symbol>/select', methods=['POST'])
-def symbol_select(symbol):
-    data = request.json or {}
-    if mt5.symbol_select(symbol, data.get('enable', True)):
-        return jsonify({"success": True})
-    return jsonify(err()), 400
-
-# ============== Price ==============
-@app.route('/api/price/<symbol>', methods=['GET'])
-def get_price(symbol):
-    tick = mt5.symbol_info_tick(symbol)
-    if tick:
-        return jsonify({"symbol": symbol, "bid": tick.bid, "ask": tick.ask, "last": tick.last,
-                       "volume": tick.volume, "time": datetime.fromtimestamp(tick.time).isoformat()})
-    return jsonify(err()), 400
-
-@app.route('/api/tick/<symbol>', methods=['GET'])
-def get_tick(symbol):
-    return get_price(symbol)
-
-# ============== Candles ==============
-@app.route('/api/candles/<symbol>', methods=['GET'])
-def get_candles(symbol):
-    tf = request.args.get('timeframe', 'H1').upper()
-    count = int(request.args.get('count', 100))
-    if tf not in TIMEFRAMES:
-        return jsonify({"error": f"Invalid timeframe. Valid: {list(TIMEFRAMES.keys())}"}), 400
-    rates = mt5.copy_rates_from_pos(symbol, TIMEFRAMES[tf], 0, count)
-    if rates is not None and len(rates) > 0:
-        candles = [{"time": datetime.fromtimestamp(r['time']).isoformat(), "open": float(r['open']),
-                   "high": float(r['high']), "low": float(r['low']), "close": float(r['close']),
-                   "volume": int(r['tick_volume']), "spread": int(r['spread'])} for r in rates]
-        return jsonify({"symbol": symbol, "timeframe": tf, "count": len(candles), "candles": candles})
-    return jsonify(err()), 400
-
-@app.route('/api/rates/<symbol>', methods=['GET'])
-def get_rates(symbol):
-    return get_candles(symbol)
-
-# ============== Indicators ==============
-def get_rates_data(symbol, tf, count):
-    if tf not in TIMEFRAMES:
-        return None, "Invalid timeframe"
-    rates = mt5.copy_rates_from_pos(symbol, TIMEFRAMES[tf], 0, count)
-    if rates is None or len(rates) == 0:
-        return None, err()
-    return rates, None
-
-@app.route('/api/indicator/rsi/<symbol>', methods=['GET'])
-def get_rsi(symbol):
-    tf = request.args.get('timeframe', 'H1').upper()
-    period = int(request.args.get('period', 14))
-    count = int(request.args.get('count', 100))
-    rates, error = get_rates_data(symbol, tf, count + period + 10)
-    if error: return jsonify(error), 400
-    closes = [float(r['close']) for r in rates]
-    rsi = calc_rsi(closes, period)
-    times = [datetime.fromtimestamp(r['time']).isoformat() for r in rates[period+1:]]
-    n = min(len(times), len(rsi), count)
-    result = [{"time": times[i], "rsi": round(rsi[i], 2)} for i in range(n)]
-    return jsonify({"symbol": symbol, "timeframe": tf, "period": period, "count": len(result), "values": result[-count:]})
-
-@app.route('/api/indicator/ma/<symbol>', methods=['GET'])
-def get_ma(symbol):
-    tf = request.args.get('timeframe', 'H1').upper()
-    period = int(request.args.get('period', 14))
-    ma_type = request.args.get('type', 'sma').lower()
-    count = int(request.args.get('count', 100))
-    applied = request.args.get('applied', 'close').lower()
-    rates, error = get_rates_data(symbol, tf, count + period + 10)
-    if error: return jsonify(error), 400
-    if applied == 'hl2':
-        data = [(float(r['high']) + float(r['low'])) / 2 for r in rates]
-    elif applied == 'hlc3':
-        data = [(float(r['high']) + float(r['low']) + float(r['close'])) / 3 for r in rates]
-    elif applied == 'ohlc4':
-        data = [(float(r['open']) + float(r['high']) + float(r['low']) + float(r['close'])) / 4 for r in rates]
-    else:
-        data = [float(r[applied]) for r in rates]
-    ma_funcs = {'sma': calc_sma, 'ema': calc_ema, 'smma': calc_smma, 'lwma': calc_lwma}
-    if ma_type not in ma_funcs:
-        return jsonify({"error": f"Invalid MA type. Valid: {list(ma_funcs.keys())}"}), 400
-    ma = ma_funcs[ma_type](data, period)
-    times = [datetime.fromtimestamp(r['time']).isoformat() for r in rates[period-1:]]
-    n = min(len(times), len(ma), count)
-    result = [{"time": times[i], "value": round(ma[i], 5)} for i in range(n)]
-    return jsonify({"symbol": symbol, "timeframe": tf, "period": period, "type": ma_type, "count": len(result), "values": result[-count:]})
-
-@app.route('/api/indicator/macd/<symbol>', methods=['GET'])
-def get_macd(symbol):
-    tf = request.args.get('timeframe', 'H1').upper()
-    fast = int(request.args.get('fast', 12))
-    slow = int(request.args.get('slow', 26))
-    signal = int(request.args.get('signal', 9))
-    count = int(request.args.get('count', 100))
-    rates, error = get_rates_data(symbol, tf, count + slow + signal + 50)
-    if error: return jsonify(error), 400
-    closes = [float(r['close']) for r in rates]
-    macd = calc_macd(closes, fast, slow, signal)
-    n = min(len(macd['signal']), count)
-    times = [datetime.fromtimestamp(r['time']).isoformat() for r in rates[-n:]]
-    result = [{"time": times[i], "macd": round(macd['macd'][-n:][i], 5), "signal": round(macd['signal'][-n:][i], 5), 
-              "histogram": round(macd['histogram'][-n:][i], 5)} for i in range(n)]
-    return jsonify({"symbol": symbol, "timeframe": tf, "fast": fast, "slow": slow, "signal_period": signal, "values": result})
-
-@app.route('/api/indicator/bollinger/<symbol>', methods=['GET'])
-def get_bollinger(symbol):
-    tf = request.args.get('timeframe', 'H1').upper()
-    period = int(request.args.get('period', 20))
-    std_dev = float(request.args.get('std_dev', 2))
-    count = int(request.args.get('count', 100))
-    rates, error = get_rates_data(symbol, tf, count + period + 10)
-    if error: return jsonify(error), 400
-    closes = [float(r['close']) for r in rates]
-    bb = calc_bollinger(closes, period, std_dev)
-    n = min(len(bb['middle']), count)
-    times = [datetime.fromtimestamp(r['time']).isoformat() for r in rates[-n:]]
-    result = [{"time": times[i], "upper": round(bb['upper'][-n:][i], 5), "middle": round(bb['middle'][-n:][i], 5), 
-              "lower": round(bb['lower'][-n:][i], 5)} for i in range(n)]
-    return jsonify({"symbol": symbol, "timeframe": tf, "period": period, "std_dev": std_dev, "values": result})
-
-@app.route('/api/indicator/stochastic/<symbol>', methods=['GET'])
-def get_stochastic(symbol):
-    tf = request.args.get('timeframe', 'H1').upper()
-    k_period = int(request.args.get('k_period', 14))
-    d_period = int(request.args.get('d_period', 3))
-    count = int(request.args.get('count', 100))
-    rates, error = get_rates_data(symbol, tf, count + k_period + d_period + 10)
-    if error: return jsonify(error), 400
-    high = [float(r['high']) for r in rates]
-    low = [float(r['low']) for r in rates]
-    close = [float(r['close']) for r in rates]
-    stoch = calc_stochastic(high, low, close, k_period, d_period)
-    n = min(len(stoch['d']), count)
-    times = [datetime.fromtimestamp(r['time']).isoformat() for r in rates[-n:]]
-    result = [{"time": times[i], "k": round(stoch['k'][-n:][i], 2), "d": round(stoch['d'][-n:][i], 2)} for i in range(n)]
-    return jsonify({"symbol": symbol, "timeframe": tf, "k_period": k_period, "d_period": d_period, "values": result})
-
-@app.route('/api/indicator/atr/<symbol>', methods=['GET'])
-def get_atr(symbol):
-    tf = request.args.get('timeframe', 'H1').upper()
-    period = int(request.args.get('period', 14))
-    count = int(request.args.get('count', 100))
-    rates, error = get_rates_data(symbol, tf, count + period + 10)
-    if error: return jsonify(error), 400
-    high = [float(r['high']) for r in rates]
-    low = [float(r['low']) for r in rates]
-    close = [float(r['close']) for r in rates]
-    atr = calc_atr(high, low, close, period)
-    n = min(len(atr), count)
-    times = [datetime.fromtimestamp(r['time']).isoformat() for r in rates[-n:]]
-    result = [{"time": times[i], "atr": round(atr[-n:][i], 5)} for i in range(n)]
-    return jsonify({"symbol": symbol, "timeframe": tf, "period": period, "values": result})
-
-@app.route('/api/indicator/cci/<symbol>', methods=['GET'])
-def get_cci(symbol):
-    tf = request.args.get('timeframe', 'H1').upper()
-    period = int(request.args.get('period', 20))
-    count = int(request.args.get('count', 100))
-    rates, error = get_rates_data(symbol, tf, count + period + 10)
-    if error: return jsonify(error), 400
-    high = [float(r['high']) for r in rates]
-    low = [float(r['low']) for r in rates]
-    close = [float(r['close']) for r in rates]
-    cci = calc_cci(high, low, close, period)
-    n = min(len(cci), count)
-    times = [datetime.fromtimestamp(r['time']).isoformat() for r in rates[-n:]]
-    result = [{"time": times[i], "cci": round(cci[-n:][i], 2)} for i in range(n)]
-    return jsonify({"symbol": symbol, "timeframe": tf, "period": period, "values": result})
-
-@app.route('/api/indicator/williams/<symbol>', methods=['GET'])
-def get_williams(symbol):
-    tf = request.args.get('timeframe', 'H1').upper()
-    period = int(request.args.get('period', 14))
-    count = int(request.args.get('count', 100))
-    rates, error = get_rates_data(symbol, tf, count + period + 10)
-    if error: return jsonify(error), 400
-    high = [float(r['high']) for r in rates]
-    low = [float(r['low']) for r in rates]
-    close = [float(r['close']) for r in rates]
-    wr = calc_williams_r(high, low, close, period)
-    n = min(len(wr), count)
-    times = [datetime.fromtimestamp(r['time']).isoformat() for r in rates[-n:]]
-    result = [{"time": times[i], "williams_r": round(wr[-n:][i], 2)} for i in range(n)]
-    return jsonify({"symbol": symbol, "timeframe": tf, "period": period, "values": result})
-
-@app.route('/api/indicator/momentum/<symbol>', methods=['GET'])
-def get_momentum(symbol):
-    tf = request.args.get('timeframe', 'H1').upper()
-    period = int(request.args.get('period', 10))
-    count = int(request.args.get('count', 100))
-    rates, error = get_rates_data(symbol, tf, count + period + 10)
-    if error: return jsonify(error), 400
-    closes = [float(r['close']) for r in rates]
-    mom = calc_momentum(closes, period)
-    n = min(len(mom), count)
-    times = [datetime.fromtimestamp(r['time']).isoformat() for r in rates[-n:]]
-    result = [{"time": times[i], "momentum": round(mom[-n:][i], 5)} for i in range(n)]
-    return jsonify({"symbol": symbol, "timeframe": tf, "period": period, "values": result})
-
-# ============== Live Indicators (includes current forming bar) ==============
-@app.route('/api/live/rsi/<symbol>', methods=['GET'])
-def get_live_rsi(symbol):
-    """Get live RSI including current bar"""
-    tf = request.args.get('timeframe', 'H1').upper()
-    period = int(request.args.get('period', 14))
-    if tf not in TIMEFRAMES:
-        return jsonify({"error": "Invalid timeframe"}), 400
-    rates = mt5.copy_rates_from_pos(symbol, TIMEFRAMES[tf], 0, period + 20)
-    if rates is None or len(rates) < period + 1:
-        return jsonify(err()), 400
-    closes = [float(r['close']) for r in rates]
-    rsi = calc_rsi(closes, period)
-    if not rsi:
-        return jsonify({"error": "Not enough data"}), 400
-    tick = mt5.symbol_info_tick(symbol)
-    return jsonify({
-        "symbol": symbol, "timeframe": tf, "period": period, "live": True,
-        "rsi": round(rsi[-1], 2),
-        "price": tick.bid if tick else None,
-        "time": datetime.fromtimestamp(rates[-1]['time']).isoformat()
-    })
-
-@app.route('/api/live/ma/<symbol>', methods=['GET'])
-def get_live_ma(symbol):
-    """Get live MA including current bar"""
-    tf = request.args.get('timeframe', 'H1').upper()
-    period = int(request.args.get('period', 14))
-    ma_type = request.args.get('type', 'sma').lower()
-    applied = request.args.get('applied', 'close').lower()
-    if tf not in TIMEFRAMES:
-        return jsonify({"error": "Invalid timeframe"}), 400
-    rates = mt5.copy_rates_from_pos(symbol, TIMEFRAMES[tf], 0, period + 10)
-    if rates is None or len(rates) < period:
-        return jsonify(err()), 400
-    if applied == 'hl2':
-        data = [(float(r['high']) + float(r['low'])) / 2 for r in rates]
-    elif applied == 'hlc3':
-        data = [(float(r['high']) + float(r['low']) + float(r['close'])) / 3 for r in rates]
-    elif applied == 'ohlc4':
-        data = [(float(r['open']) + float(r['high']) + float(r['low']) + float(r['close'])) / 4 for r in rates]
-    else:
-        data = [float(r[applied]) for r in rates]
-    ma_funcs = {'sma': calc_sma, 'ema': calc_ema, 'smma': calc_smma, 'lwma': calc_lwma}
-    if ma_type not in ma_funcs:
-        return jsonify({"error": f"Invalid MA type. Valid: {list(ma_funcs.keys())}"}), 400
-    ma = ma_funcs[ma_type](data, period)
-    if not ma:
-        return jsonify({"error": "Not enough data"}), 400
-    tick = mt5.symbol_info_tick(symbol)
-    return jsonify({
-        "symbol": symbol, "timeframe": tf, "period": period, "type": ma_type, "live": True,
-        "value": round(ma[-1], 5),
-        "price": tick.bid if tick else None,
-        "time": datetime.fromtimestamp(rates[-1]['time']).isoformat()
-    })
-
-@app.route('/api/live/macd/<symbol>', methods=['GET'])
-def get_live_macd(symbol):
-    """Get live MACD including current bar"""
-    tf = request.args.get('timeframe', 'H1').upper()
-    fast = int(request.args.get('fast', 12))
-    slow = int(request.args.get('slow', 26))
-    signal = int(request.args.get('signal', 9))
-    if tf not in TIMEFRAMES:
-        return jsonify({"error": "Invalid timeframe"}), 400
-    rates = mt5.copy_rates_from_pos(symbol, TIMEFRAMES[tf], 0, slow + signal + 20)
-    if rates is None:
-        return jsonify(err()), 400
-    closes = [float(r['close']) for r in rates]
-    macd = calc_macd(closes, fast, slow, signal)
-    if not macd['signal']:
-        return jsonify({"error": "Not enough data"}), 400
-    tick = mt5.symbol_info_tick(symbol)
-    return jsonify({
-        "symbol": symbol, "timeframe": tf, "fast": fast, "slow": slow, "signal_period": signal, "live": True,
-        "macd": round(macd['macd'][-1], 5),
-        "signal": round(macd['signal'][-1], 5),
-        "histogram": round(macd['histogram'][-1], 5),
-        "price": tick.bid if tick else None,
-        "time": datetime.fromtimestamp(rates[-1]['time']).isoformat()
-    })
-
-@app.route('/api/live/bollinger/<symbol>', methods=['GET'])
-def get_live_bollinger(symbol):
-    """Get live Bollinger Bands including current bar"""
-    tf = request.args.get('timeframe', 'H1').upper()
-    period = int(request.args.get('period', 20))
-    std_dev = float(request.args.get('std_dev', 2))
-    if tf not in TIMEFRAMES:
-        return jsonify({"error": "Invalid timeframe"}), 400
-    rates = mt5.copy_rates_from_pos(symbol, TIMEFRAMES[tf], 0, period + 10)
-    if rates is None or len(rates) < period:
-        return jsonify(err()), 400
-    closes = [float(r['close']) for r in rates]
-    bb = calc_bollinger(closes, period, std_dev)
-    if not bb['middle']:
-        return jsonify({"error": "Not enough data"}), 400
-    tick = mt5.symbol_info_tick(symbol)
-    return jsonify({
-        "symbol": symbol, "timeframe": tf, "period": period, "std_dev": std_dev, "live": True,
-        "upper": round(bb['upper'][-1], 5),
-        "middle": round(bb['middle'][-1], 5),
-        "lower": round(bb['lower'][-1], 5),
-        "price": tick.bid if tick else None,
-        "time": datetime.fromtimestamp(rates[-1]['time']).isoformat()
-    })
-
-@app.route('/api/live/stochastic/<symbol>', methods=['GET'])
-def get_live_stochastic(symbol):
-    """Get live Stochastic including current bar"""
-    tf = request.args.get('timeframe', 'H1').upper()
-    k_period = int(request.args.get('k_period', 14))
-    d_period = int(request.args.get('d_period', 3))
-    if tf not in TIMEFRAMES:
-        return jsonify({"error": "Invalid timeframe"}), 400
-    rates = mt5.copy_rates_from_pos(symbol, TIMEFRAMES[tf], 0, k_period + d_period + 10)
-    if rates is None:
-        return jsonify(err()), 400
-    high = [float(r['high']) for r in rates]
-    low = [float(r['low']) for r in rates]
-    close = [float(r['close']) for r in rates]
-    stoch = calc_stochastic(high, low, close, k_period, d_period)
-    if not stoch['d']:
-        return jsonify({"error": "Not enough data"}), 400
-    tick = mt5.symbol_info_tick(symbol)
-    return jsonify({
-        "symbol": symbol, "timeframe": tf, "k_period": k_period, "d_period": d_period, "live": True,
-        "k": round(stoch['k'][-1], 2),
-        "d": round(stoch['d'][-1], 2),
-        "price": tick.bid if tick else None,
-        "time": datetime.fromtimestamp(rates[-1]['time']).isoformat()
-    })
-
-@app.route('/api/live/atr/<symbol>', methods=['GET'])
-def get_live_atr(symbol):
-    """Get live ATR including current bar"""
-    tf = request.args.get('timeframe', 'H1').upper()
-    period = int(request.args.get('period', 14))
-    if tf not in TIMEFRAMES:
-        return jsonify({"error": "Invalid timeframe"}), 400
-    rates = mt5.copy_rates_from_pos(symbol, TIMEFRAMES[tf], 0, period + 10)
-    if rates is None:
-        return jsonify(err()), 400
-    high = [float(r['high']) for r in rates]
-    low = [float(r['low']) for r in rates]
-    close = [float(r['close']) for r in rates]
-    atr = calc_atr(high, low, close, period)
-    if not atr:
-        return jsonify({"error": "Not enough data"}), 400
-    tick = mt5.symbol_info_tick(symbol)
-    return jsonify({
-        "symbol": symbol, "timeframe": tf, "period": period, "live": True,
-        "atr": round(atr[-1], 5),
-        "price": tick.bid if tick else None,
-        "time": datetime.fromtimestamp(rates[-1]['time']).isoformat()
-    })
-
-@app.route('/api/live/cci/<symbol>', methods=['GET'])
-def get_live_cci(symbol):
-    """Get live CCI including current bar"""
-    tf = request.args.get('timeframe', 'H1').upper()
-    period = int(request.args.get('period', 20))
-    if tf not in TIMEFRAMES:
-        return jsonify({"error": "Invalid timeframe"}), 400
-    rates = mt5.copy_rates_from_pos(symbol, TIMEFRAMES[tf], 0, period + 10)
-    if rates is None:
-        return jsonify(err()), 400
-    high = [float(r['high']) for r in rates]
-    low = [float(r['low']) for r in rates]
-    close = [float(r['close']) for r in rates]
-    cci = calc_cci(high, low, close, period)
-    if not cci:
-        return jsonify({"error": "Not enough data"}), 400
-    tick = mt5.symbol_info_tick(symbol)
-    return jsonify({
-        "symbol": symbol, "timeframe": tf, "period": period, "live": True,
-        "cci": round(cci[-1], 2),
-        "price": tick.bid if tick else None,
-        "time": datetime.fromtimestamp(rates[-1]['time']).isoformat()
-    })
-
-@app.route('/api/live/all/<symbol>', methods=['GET'])
-def get_live_all(symbol):
-    """Get all live indicators in one call"""
-    tf = request.args.get('timeframe', 'H1').upper()
-    if tf not in TIMEFRAMES:
-        return jsonify({"error": "Invalid timeframe"}), 400
-    
-    # Get enough data for all indicators
-    rates = mt5.copy_rates_from_pos(symbol, TIMEFRAMES[tf], 0, 50)
-    if rates is None or len(rates) < 30:
-        return jsonify(err()), 400
-    
-    closes = [float(r['close']) for r in rates]
-    high = [float(r['high']) for r in rates]
-    low = [float(r['low']) for r in rates]
-    
-    tick = mt5.symbol_info_tick(symbol)
-    
-    # Calculate all indicators
-    rsi = calc_rsi(closes, 14)
-    sma = calc_sma(closes, 14)
-    ema = calc_ema(closes, 14)
-    macd = calc_macd(closes, 12, 26, 9)
-    bb = calc_bollinger(closes, 20, 2)
-    stoch = calc_stochastic(high, low, closes, 14, 3)
-    atr = calc_atr(high, low, closes, 14)
-    
-    result = {
-        "symbol": symbol,
-        "timeframe": tf,
-        "live": True,
-        "price": {"bid": tick.bid, "ask": tick.ask} if tick else None,
-        "time": datetime.fromtimestamp(rates[-1]['time']).isoformat(),
-        "indicators": {}
-    }
-    
-    if rsi: result["indicators"]["rsi"] = round(rsi[-1], 2)
-    if sma: result["indicators"]["sma14"] = round(sma[-1], 5)
-    if ema: result["indicators"]["ema14"] = round(ema[-1], 5)
-    if macd['signal']:
-        result["indicators"]["macd"] = {
-            "macd": round(macd['macd'][-1], 5),
-            "signal": round(macd['signal'][-1], 5),
-            "histogram": round(macd['histogram'][-1], 5)
-        }
-    if bb['middle']:
-        result["indicators"]["bollinger"] = {
-            "upper": round(bb['upper'][-1], 5),
-            "middle": round(bb['middle'][-1], 5),
-            "lower": round(bb['lower'][-1], 5)
-        }
-    if stoch['d']:
-        result["indicators"]["stochastic"] = {
-            "k": round(stoch['k'][-1], 2),
-            "d": round(stoch['d'][-1], 2)
-        }
-    if atr: result["indicators"]["atr"] = round(atr[-1], 5)
-    
-    return jsonify(result)
-
-# ============== Trading ==============
-@app.route('/api/trade/open', methods=['POST'])
-def open_trade():
-    """Open trade with SL/TP in points or price. Use 0 for no SL/TP."""
-    data = request.json or {}
-    symbol = data.get('symbol')
-    order_type = data.get('type', 'buy').lower()
-    volume = float(data.get('volume', 0.01))
-    sl = float(data.get('sl', 0))
-    tp = float(data.get('tp', 0))
-    sl_points = data.get('sl_points')
-    tp_points = data.get('tp_points')
-    price = data.get('price')
-    deviation = int(data.get('deviation', 20))
-    magic = int(data.get('magic', 0))
-    comment = data.get('comment', 'API')
-    
-    if not symbol:
-        return jsonify({"error": "Symbol required"}), 400
-    
-    info = mt5.symbol_info(symbol)
-    if not info:
-        return jsonify({"error": f"Symbol {symbol} not found"}), 404
-    if not info.visible:
-        mt5.symbol_select(symbol, True)
-    
-    tick = mt5.symbol_info_tick(symbol)
-    if not tick:
-        return jsonify(err()), 400
-    
-    point = info.point
-    stops_level = info.trade_stops_level  # Minimum distance for SL/TP in points
-    
-    # Ensure SL/TP points are at least the minimum required
-    if sl_points and sl_points > 0 and sl_points < stops_level:
-        sl_points = stops_level + 10  # Add buffer
-        print(f"[TRADE] SL points adjusted to minimum: {sl_points}")
-    if tp_points and tp_points > 0 and tp_points < stops_level:
-        tp_points = stops_level + 10  # Add buffer
-        print(f"[TRADE] TP points adjusted to minimum: {tp_points}")
-    
-    if order_type == 'buy':
-        trade_type, trade_price = mt5.ORDER_TYPE_BUY, price or tick.ask
-        if sl_points and sl_points > 0: sl = trade_price - sl_points * point
-        if tp_points and tp_points > 0: tp = trade_price + tp_points * point
-    elif order_type == 'sell':
-        trade_type, trade_price = mt5.ORDER_TYPE_SELL, price or tick.bid
-        if sl_points and sl_points > 0: sl = trade_price + sl_points * point
-        if tp_points and tp_points > 0: tp = trade_price - tp_points * point
-    elif order_type == 'buy_limit':
-        trade_type, trade_price = mt5.ORDER_TYPE_BUY_LIMIT, price
-        if sl_points and sl_points > 0: sl = trade_price - sl_points * point
-        if tp_points and tp_points > 0: tp = trade_price + tp_points * point
-    elif order_type == 'sell_limit':
-        trade_type, trade_price = mt5.ORDER_TYPE_SELL_LIMIT, price
-        if sl_points and sl_points > 0: sl = trade_price + sl_points * point
-        if tp_points and tp_points > 0: tp = trade_price - tp_points * point
-    elif order_type == 'buy_stop':
-        trade_type, trade_price = mt5.ORDER_TYPE_BUY_STOP, price
-        if sl_points and sl_points > 0: sl = trade_price - sl_points * point
-        if tp_points and tp_points > 0: tp = trade_price + tp_points * point
-    elif order_type == 'sell_stop':
-        trade_type, trade_price = mt5.ORDER_TYPE_SELL_STOP, price
-        if sl_points and sl_points > 0: sl = trade_price + sl_points * point
-        if tp_points and tp_points > 0: tp = trade_price - tp_points * point
-    else:
-        return jsonify({"error": f"Invalid order type: {order_type}"}), 400
-    
-    if trade_price is None:
-        return jsonify({"error": "Price required for pending orders"}), 400
-    
-    sl = round(sl, info.digits) if sl > 0 else 0.0
-    tp = round(tp, info.digits) if tp > 0 else 0.0
-    
-    # Debug logging
-    print(f"[TRADE] Opening {order_type} {symbol} @ {trade_price}")
-    print(f"[TRADE] SL Points: {sl_points}, TP Points: {tp_points}")
-    print(f"[TRADE] Calculated SL: {sl}, TP: {tp}, Point: {point}")
-    
-    req = {
-        "action": mt5.TRADE_ACTION_DEAL if order_type in ['buy', 'sell'] else mt5.TRADE_ACTION_PENDING,
-        "symbol": symbol, "volume": volume, "type": trade_type, "price": trade_price,
-        "sl": sl, "tp": tp, "deviation": deviation, "magic": magic, "comment": comment,
-        "type_time": mt5.ORDER_TIME_GTC, "type_filling": mt5.ORDER_FILLING_IOC
-    }
-    
-    print(f"[TRADE] Request: {req}")
-    
-    result = mt5.order_send(req)
-    if result and result.retcode == mt5.TRADE_RETCODE_DONE:
-        print(f"[TRADE] Success! Ticket: {result.order}")
-        return jsonify({"success": True, "ticket": result.order, "result": result_to_dict(result),
-                       "debug": {"sl": sl, "tp": tp, "sl_points": sl_points, "tp_points": tp_points}})
-    print(f"[TRADE] Failed: {result}")
-    return jsonify({"success": False, "result": result_to_dict(result), **err()}), 400
-
-@app.route('/api/trade/close', methods=['POST'])
-def close_trade():
-    """Close trade by ticket number"""
-    data = request.json or {}
-    ticket = data.get('ticket')
-    volume = data.get('volume')
-    deviation = int(data.get('deviation', 20))
-    comment = data.get('comment', 'API Close')
-    
-    if not ticket:
-        return jsonify({"error": "Ticket required"}), 400
-    
-    positions = mt5.positions_get(ticket=int(ticket))
-    if not positions:
-        return jsonify({"error": "Position not found"}), 404
-    
-    pos = positions[0]
-    tick = mt5.symbol_info_tick(pos.symbol)
-    if not tick:
-        return jsonify(err()), 400
-    
-    close_price = tick.bid if pos.type == mt5.ORDER_TYPE_BUY else tick.ask
-    close_type = mt5.ORDER_TYPE_SELL if pos.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
-    close_volume = volume if volume else pos.volume
-    
-    req = {
-        "action": mt5.TRADE_ACTION_DEAL, "symbol": pos.symbol, "volume": close_volume,
-        "type": close_type, "position": pos.ticket, "price": close_price,
-        "deviation": deviation, "comment": comment, "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": mt5.ORDER_FILLING_IOC
-    }
-    
-    result = mt5.order_send(req)
-    if result and result.retcode == mt5.TRADE_RETCODE_DONE:
-        return jsonify({"success": True, "result": result_to_dict(result)})
-    return jsonify({"success": False, "result": result_to_dict(result), **err()}), 400
-
-@app.route('/api/trade/close_all', methods=['POST'])
-def close_all_trades():
-    """Close all positions or by symbol/magic"""
-    data = request.json or {}
-    symbol = data.get('symbol')
-    magic = data.get('magic')
-    
-    positions = mt5.positions_get(symbol=symbol) if symbol else mt5.positions_get()
-    if not positions:
-        return jsonify({"message": "No positions to close", "closed": 0})
-    
-    if magic:
-        positions = [p for p in positions if p.magic == int(magic)]
-    
-    results = []
-    for pos in positions:
-        tick = mt5.symbol_info_tick(pos.symbol)
-        if not tick:
-            results.append({"ticket": pos.ticket, "success": False, "error": "No tick"})
-            continue
-        close_price = tick.bid if pos.type == mt5.ORDER_TYPE_BUY else tick.ask
-        close_type = mt5.ORDER_TYPE_SELL if pos.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
-        req = {"action": mt5.TRADE_ACTION_DEAL, "symbol": pos.symbol, "volume": pos.volume,
-               "type": close_type, "position": pos.ticket, "price": close_price,
-               "deviation": 20, "type_time": mt5.ORDER_TIME_GTC, "type_filling": mt5.ORDER_FILLING_IOC}
-        r = mt5.order_send(req)
-        results.append({"ticket": pos.ticket, "success": r and r.retcode == mt5.TRADE_RETCODE_DONE})
-    
-    return jsonify({"closed": sum(1 for r in results if r['success']), "results": results})
-
-@app.route('/api/trade/modify', methods=['POST'])
-def modify_trade():
-    """Modify SL/TP of open position.
-    For points: 0 = keep current, -1 = remove, positive = set points from price
-    For price: 0 = remove SL/TP, positive = set exact price
-    """
-    data = request.json or {}
-    ticket = data.get('ticket')
-    sl = data.get('sl')
-    tp = data.get('tp')
-    sl_points = data.get('sl_points')
-    tp_points = data.get('tp_points')
-    
-    if not ticket:
-        return jsonify({"error": "Ticket required"}), 400
-    
-    positions = mt5.positions_get(ticket=int(ticket))
-    if not positions:
-        return jsonify({"error": "Position not found"}), 404
-    
-    pos = positions[0]
-    info = mt5.symbol_info(pos.symbol)
-    point = info.point
-    
-    # Start with current values
-    new_sl = pos.sl
-    new_tp = pos.tp
-    
-    # Handle SL points: 0=keep, -1=remove, >0=set (from ENTRY price)
-    if sl_points is not None:
-        if sl_points == 0:
-            new_sl = pos.sl  # Keep current
-        elif sl_points < 0:
-            new_sl = 0.0  # Remove SL
-        else:
-            if pos.type == mt5.ORDER_TYPE_BUY:
-                new_sl = pos.price_open - sl_points * point  # SL below entry for BUY
-            else:
-                new_sl = pos.price_open + sl_points * point  # SL above entry for SELL
-    # Handle SL price directly
-    elif sl is not None:
-        new_sl = float(sl)
-    
-    # Handle TP points: 0=keep, -1=remove, >0=set (from ENTRY price)
-    if tp_points is not None:
-        if tp_points == 0:
-            new_tp = pos.tp  # Keep current
-        elif tp_points < 0:
-            new_tp = 0.0  # Remove TP
-        else:
-            if pos.type == mt5.ORDER_TYPE_BUY:
-                new_tp = pos.price_open + tp_points * point  # TP above entry for BUY
-            else:
-                new_tp = pos.price_open - tp_points * point  # TP below entry for SELL
-    # Handle TP price directly
-    elif tp is not None:
-        new_tp = float(tp)
-    
-    # Round to symbol digits
-    new_sl = round(new_sl, info.digits)
-    new_tp = round(new_tp, info.digits)
-    
-    req = {"action": mt5.TRADE_ACTION_SLTP, "symbol": pos.symbol, "position": pos.ticket,
-           "sl": new_sl, "tp": new_tp}
-    
-    result = mt5.order_send(req)
-    if result and result.retcode == mt5.TRADE_RETCODE_DONE:
-        return jsonify({"success": True, "sl": new_sl, "tp": new_tp, "result": result_to_dict(result)})
-    return jsonify({"success": False, "result": result_to_dict(result), **err()}), 400
-
-@app.route('/api/order/cancel', methods=['POST'])
-@app.route('/api/order/cancel/<int:ticket>', methods=['POST', 'DELETE'])
-def cancel_order(ticket=None):
-    """Cancel pending order"""
-    if ticket is None:
-        data = request.json or {}
-        ticket = data.get('ticket')
-    if not ticket:
-        return jsonify({"error": "Ticket required"}), 400
-    req = {"action": mt5.TRADE_ACTION_REMOVE, "order": int(ticket)}
-    result = mt5.order_send(req)
-    if result and result.retcode == mt5.TRADE_RETCODE_DONE:
-        return jsonify({"success": True, "result": result_to_dict(result)})
-    return jsonify({"success": False, "result": result_to_dict(result), **err()}), 400
-
-# Alias for pending order placement
-@app.route('/api/trade/pending', methods=['POST'])
-def place_pending_order():
-    """Alias for /api/trade - places pending orders"""
-    return open_trade()
-
-# ============== Positions & Orders ==============
-@app.route('/api/positions', methods=['GET'])
-def get_positions():
-    symbol = request.args.get('symbol')
-    ticket = request.args.get('ticket')
-    magic = request.args.get('magic')
-    if ticket:
-        positions = mt5.positions_get(ticket=int(ticket))
-    elif symbol:
-        positions = mt5.positions_get(symbol=symbol)
-    else:
-        positions = mt5.positions_get()
-    if positions is not None:
-        result = [pos_to_dict(p) for p in positions]
-        if magic:
-            result = [p for p in result if p['magic'] == int(magic)]
-        total_profit = sum(p['profit'] for p in result)
-        return jsonify({"count": len(result), "total_profit": total_profit, "positions": result})
-    return jsonify(err()), 400
-
-@app.route('/api/orders', methods=['GET'])
-def get_orders():
-    symbol = request.args.get('symbol')
-    ticket = request.args.get('ticket')
-    if ticket:
-        orders = mt5.orders_get(ticket=int(ticket))
-    elif symbol:
-        orders = mt5.orders_get(symbol=symbol)
-    else:
-        orders = mt5.orders_get()
-    if orders is not None:
-        return jsonify({"count": len(orders), "orders": [order_to_dict(o) for o in orders]})
-    return jsonify(err()), 400
-
-@app.route('/api/history/sync', methods=['POST'])
-def sync_history():
-    """Force sync history from broker by re-requesting it"""
-    try:
-        # Try to trigger history download by requesting a very long period
-        from_dt = datetime(2020, 1, 1)
-        to_dt = datetime.now() + timedelta(days=1)
-        
-        # Request deals which forces MT5 to sync from server
-        deals = mt5.history_deals_get(from_dt, to_dt)
-        orders = mt5.history_orders_get(from_dt, to_dt)
-        
-        deal_count = len(deals) if deals else 0
-        order_count = len(orders) if orders else 0
-        
-        return jsonify({
-            "success": True,
-            "message": "History synced",
-            "deals_found": deal_count,
-            "orders_found": order_count
+def rates_to_bars(rates) -> list[dict[str, Any]]:
+    bars = []
+    for r in rates:
+        bars.append({
+            "time": int(r["time"]),
+            "open": float(r["open"]),
+            "high": float(r["high"]),
+            "low": float(r["low"]),
+            "close": float(r["close"]),
+            "volume": int(r["tick_volume"]),
         })
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+    return bars
 
-@app.route('/api/history/deals', methods=['GET'])
-def get_history_deals():
-    days = int(request.args.get('days', 30))
-    symbol = request.args.get('symbol')
-    
-    # Use a wider date range to catch all history
-    from_dt = datetime(2020, 1, 1) if days > 365 else datetime.now() - timedelta(days=days)
-    to_dt = datetime.now() + timedelta(days=1)  # Include today fully
-    
-    if symbol:
-        deals = mt5.history_deals_get(from_dt, to_dt, group=f"*{symbol}*")
-    else:
-        deals = mt5.history_deals_get(from_dt, to_dt)
-    if deals is not None:
-        result = [deal_to_dict(d) for d in deals]
-        total_profit = sum(d['profit'] for d in result)
-        return jsonify({"count": len(result), "total_profit": total_profit, "deals": result})
-    return jsonify(err()), 400
 
-@app.route('/api/history/orders', methods=['GET'])
-def get_history_orders():
-    days = int(request.args.get('days', 30))
-    from_dt = datetime.now() - timedelta(days=days)
-    to_dt = datetime.now()
-    orders = mt5.history_orders_get(from_dt, to_dt)
-    if orders is not None:
-        return jsonify({"count": len(orders), "orders": [order_to_dict(o) for o in orders]})
-    return jsonify(err()), 400
-
-# ============== Utilities ==============
-@app.route('/api/calc/margin', methods=['POST'])
-def calc_margin():
-    data = request.json or {}
-    symbol, volume = data.get('symbol'), float(data.get('volume', 0.01))
-    order_type = data.get('type', 'buy').lower()
-    if not symbol:
-        return jsonify({"error": "Symbol required"}), 400
-    tick = mt5.symbol_info_tick(symbol)
-    if not tick:
-        return jsonify(err()), 400
-    price = tick.ask if order_type == 'buy' else tick.bid
-    action = mt5.ORDER_TYPE_BUY if order_type == 'buy' else mt5.ORDER_TYPE_SELL
-    margin = mt5.order_calc_margin(action, symbol, volume, price)
-    return jsonify({"margin": margin}) if margin else (jsonify(err()), 400)
-
-@app.route('/api/calc/profit', methods=['POST'])
-def calc_profit():
-    data = request.json or {}
-    symbol = data.get('symbol')
-    volume = float(data.get('volume', 0.01))
-    order_type = data.get('type', 'buy').lower()
-    price_open = float(data.get('price_open', 0))
-    price_close = float(data.get('price_close', 0))
-    if not symbol or not price_open or not price_close:
-        return jsonify({"error": "Symbol, price_open, price_close required"}), 400
-    action = mt5.ORDER_TYPE_BUY if order_type == 'buy' else mt5.ORDER_TYPE_SELL
-    profit = mt5.order_calc_profit(action, symbol, volume, price_open, price_close)
-    return jsonify({"profit": profit}) if profit is not None else (jsonify(err()), 400)
-
-@app.route('/api/market/book/<symbol>', methods=['GET'])
-def get_book(symbol):
-    if not mt5.market_book_add(symbol):
-        return jsonify(err()), 400
-    book = mt5.market_book_get(symbol)
-    mt5.market_book_release(symbol)
-    if book:
-        return jsonify({"symbol": symbol, "book": [{"type": b.type, "price": b.price, "volume": b.volume} for b in book]})
-    return jsonify(err()), 400
-
-# ============== Trailing Stop Manager ==============
-trailing_config = {
-    "enabled": False,
-    "points": 0,
-    "magic": 0  # 0 = all positions
-}
-
-@app.route('/api/trailing/set', methods=['POST'])
-@app.route('/set_trailing_sl', methods=['POST'])  # Legacy endpoint for GUI compatibility
-def set_trailing_sl():
-    """Enable trailing stop loss for all positions"""
-    data = request.json or {}
-    points = data.get('points') or request.args.get('points', 50)
-    magic = data.get('magic') or request.args.get('magic', 0)
-    
-    trailing_config['enabled'] = True
-    trailing_config['points'] = int(points)
-    trailing_config['magic'] = int(magic)
-    
-    return jsonify({
-        "ok": True,
-        "status": "enabled",
-        "points": trailing_config['points'],
-        "magic": trailing_config['magic'],
-        "message": f"Trailing SL enabled at {points} points"
-    })
-
-@app.route('/api/trailing/disable', methods=['POST'])
-@app.route('/disable_trailing_sl', methods=['POST'])  # Legacy endpoint for GUI compatibility
-def disable_trailing_sl():
-    """Disable trailing stop loss"""
-    trailing_config['enabled'] = False
-    trailing_config['points'] = 0
-    
-    return jsonify({
-        "ok": True,
-        "status": "disabled",
-        "message": "Trailing SL disabled"
-    })
-
-@app.route('/api/trailing/status', methods=['GET'])
-@app.route('/trailing_status', methods=['GET'])  # Legacy endpoint for GUI compatibility
-def get_trailing_status():
-    """Get current trailing stop status"""
-    return jsonify({
-        "ok": True,
-        "enabled": trailing_config['enabled'],
-        "status": "enabled" if trailing_config['enabled'] else "disabled",
-        "points": trailing_config['points'],
-        "magic": trailing_config['magic']
-    })
-
-@app.route('/api/trailing/apply', methods=['POST'])
-def apply_trailing_sl():
-    """Apply trailing stop to all open positions (call periodically)"""
-    if not trailing_config['enabled']:
-        return jsonify({"ok": False, "message": "Trailing SL not enabled"})
-    
-    points = trailing_config['points']
-    magic = trailing_config['magic']
-    
-    positions = mt5.positions_get()
-    if not positions:
-        return jsonify({"ok": True, "message": "No positions", "updated": 0})
-    
-    updated = 0
-    for pos in positions:
-        # Filter by magic if specified
-        if magic and pos.magic != magic:
-            continue
-        
-        info = mt5.symbol_info(pos.symbol)
-        if not info:
-            continue
-        
-        point = info.point
-        tick = mt5.symbol_info_tick(pos.symbol)
-        if not tick:
-            continue
-        
-        new_sl = pos.sl
-        
-        if pos.type == mt5.ORDER_TYPE_BUY:
-            # For BUY: trail SL below bid price
-            trail_level = tick.bid - points * point
-            if trail_level > pos.sl and trail_level > pos.price_open:
-                new_sl = round(trail_level, info.digits)
-        else:
-            # For SELL: trail SL above ask price
-            trail_level = tick.ask + points * point
-            if (pos.sl == 0 or trail_level < pos.sl) and trail_level < pos.price_open:
-                new_sl = round(trail_level, info.digits)
-        
-        if new_sl != pos.sl and new_sl > 0:
-            req = {
-                "action": mt5.TRADE_ACTION_SLTP,
-                "symbol": pos.symbol,
-                "position": pos.ticket,
-                "sl": new_sl,
-                "tp": pos.tp
-            }
-            result = mt5.order_send(req)
-            if result and result.retcode == mt5.TRADE_RETCODE_DONE:
-                updated += 1
-    
-    return jsonify({"ok": True, "updated": updated, "total_positions": len(positions)})
-
-# ============== Trend Analysis ==============
-def calculate_trend(rates):
-    """Calculate trend from candle data: UP, DOWN, or NEUTRAL"""
-    if rates is None or len(rates) < 3:
+def calculate_trend(bars: list[dict[str, Any]]) -> str:
+    if len(bars) < 5:
         return "NEUTRAL"
-    
-    # Use last 3 candles for trend determination
-    closes = [float(r['close']) for r in rates[-3:]]
-    opens = [float(r['open']) for r in rates[-3:]]
-    
-    # Simple trend: compare first and last close
-    change = closes[-1] - closes[0]
-    avg_body = sum(abs(c - o) for c, o in zip(closes, opens)) / len(closes)
-    
-    # Need significant movement relative to average body size
-    if avg_body > 0 and abs(change) > avg_body * 0.5:
-        return "UP" if change > 0 else "DOWN"
-    
-    # Also check EMA trend
-    if len(rates) >= 5:
-        ema_short = sum(float(r['close']) for r in rates[-3:]) / 3
-        ema_long = sum(float(r['close']) for r in rates[-5:]) / 5
-        if ema_short > ema_long * 1.001:
-            return "UP"
-        elif ema_short < ema_long * 0.999:
-            return "DOWN"
-    
-    return "NEUTRAL"
-
-@app.route('/api/trend/<symbol>', methods=['GET'])
-def get_trend(symbol):
-    """Get trend analysis for multiple timeframes"""
-    timeframes = ['M1', 'M5', 'M15', 'M30', 'H1', 'D1']
-    trends = {}
-    
-    # Ensure symbol is selected
-    info = mt5.symbol_info(symbol)
-    if not info:
-        # Try with common suffixes
-        for suffix in ['', '.pr', '.m', '.r', '.pro', '.raw']:
-            test_symbol = symbol + suffix if suffix else symbol
-            info = mt5.symbol_info(test_symbol)
-            if info:
-                symbol = test_symbol
-                break
-    
-    if not info:
-        return jsonify({"error": f"Symbol {symbol} not found"}), 404
-    
-    if not info.visible:
-        mt5.symbol_select(symbol, True)
-    
-    for tf in timeframes:
-        if tf not in TIMEFRAMES:
-            trends[tf] = "NEUTRAL"
-            continue
-        
-        rates = mt5.copy_rates_from_pos(symbol, TIMEFRAMES[tf], 0, 10)
-        if rates is not None and len(rates) > 0:
-            trends[tf] = calculate_trend(rates)
-        else:
-            trends[tf] = "NEUTRAL"
-    
-    # Get current price
-    tick = mt5.symbol_info_tick(symbol)
-    price = tick.bid if tick else 0
-    
-    return jsonify({
-        "symbol": symbol,
-        "price": price,
-        "trends": trends,
-        "overall": determine_overall_trend(trends)
-    })
-
-def determine_overall_trend(trends):
-    """Determine overall trend from all timeframes"""
-    up_count = sum(1 for t in trends.values() if t == "UP")
-    down_count = sum(1 for t in trends.values() if t == "DOWN")
-    
-    if up_count >= 4:
-        return "STRONG_UP"
-    elif down_count >= 4:
-        return "STRONG_DOWN"
-    elif up_count > down_count:
+    closes = [b["close"] for b in bars]
+    ema9 = calc_ema(closes, 9)
+    ema21 = calc_ema(closes, 21)
+    if not ema9 or not ema21:
+        return "NEUTRAL"
+    short = ema9[-1]
+    long = ema21[-1]
+    if short > long * 1.0003:
         return "UP"
-    elif down_count > up_count:
+    if short < long * 0.9997:
+        return "DOWN"
+    change = closes[-1] - closes[-4]
+    if change > 0:
+        return "UP"
+    if change < 0:
         return "DOWN"
     return "NEUTRAL"
 
 
-# ============== SMC (Smart Money Concepts) Analysis ==============
-
-def find_swing_points(rates, lookback=5):
-    """Find Swing Highs and Swing Lows using fractal method"""
-    swing_highs = []
-    swing_lows = []
-    
-    if rates is None or len(rates) < lookback * 2 + 1:
+def find_swing_points(bars: list[dict[str, Any]], lookback: int = 3) -> tuple[list, list]:
+    swing_highs, swing_lows = [], []
+    if len(bars) < lookback * 2 + 1:
         return swing_highs, swing_lows
-    
-    for i in range(lookback, len(rates) - lookback):
-        # Check for Swing High
-        is_swing_high = True
-        is_swing_low = True
-        
-        current_high = rates[i]['high']
-        current_low = rates[i]['low']
-        
-        for j in range(1, lookback + 1):
-            if rates[i - j]['high'] >= current_high or rates[i + j]['high'] >= current_high:
-                is_swing_high = False
-            if rates[i - j]['low'] <= current_low or rates[i + j]['low'] <= current_low:
-                is_swing_low = False
-        
-        if is_swing_high:
-            swing_highs.append({
-                'index': i,
-                'time': int(rates[i]['time']),
-                'price': float(current_high),
-                'type': 'HIGH'
-            })
-        
-        if is_swing_low:
-            swing_lows.append({
-                'index': i,
-                'time': int(rates[i]['time']),
-                'price': float(current_low),
-                'type': 'LOW'
-            })
-    
+    for i in range(lookback, len(bars) - lookback):
+        h, l = bars[i]["high"], bars[i]["low"]
+        if all(bars[i - j]["high"] < h and bars[i + j]["high"] < h for j in range(1, lookback + 1)):
+            swing_highs.append({"index": i, "time": bars[i]["time"], "price": h})
+        if all(bars[i - j]["low"] > l and bars[i + j]["low"] > l for j in range(1, lookback + 1)):
+            swing_lows.append({"index": i, "time": bars[i]["time"], "price": l})
     return swing_highs, swing_lows
 
 
-def find_order_blocks(rates, swing_highs, swing_lows):
-    """Find Order Blocks (OB) - Last bullish/bearish candle before impulsive move"""
-    order_blocks = []
-    
-    if rates is None or len(rates) < 10:
-        return order_blocks
-    
-    # Look for Bullish Order Blocks (last bearish candle before bullish swing low)
-    for swing in swing_lows[-5:]:  # Last 5 swing lows
-        idx = swing['index']
-        if idx < 3:
-            continue
-        
-        # Find the last bearish candle before the swing low
-        for i in range(idx - 1, max(0, idx - 5), -1):
-            if rates[i]['close'] < rates[i]['open']:  # Bearish candle
-                # Check if next candles made impulsive move up
-                if idx + 2 < len(rates):
-                    move_up = rates[idx + 2]['close'] - rates[i]['low']
-                    body_size = abs(rates[i]['close'] - rates[i]['open'])
-                    if move_up > body_size * 2:  # Impulsive move
-                        order_blocks.append({
-                            'type': 'BULLISH_OB',
-                            'time': int(rates[i]['time']),
-                            'high': float(rates[i]['high']),
-                            'low': float(rates[i]['low']),
-                            'open': float(rates[i]['open']),
-                            'close': float(rates[i]['close']),
-                            'mitigated': False
-                        })
-                        break
-    
-    # Look for Bearish Order Blocks (last bullish candle before bearish swing high)
-    for swing in swing_highs[-5:]:  # Last 5 swing highs
-        idx = swing['index']
-        if idx < 3:
-            continue
-        
-        # Find the last bullish candle before the swing high
-        for i in range(idx - 1, max(0, idx - 5), -1):
-            if rates[i]['close'] > rates[i]['open']:  # Bullish candle
-                # Check if next candles made impulsive move down
-                if idx + 2 < len(rates):
-                    move_down = rates[i]['high'] - rates[idx + 2]['close']
-                    body_size = abs(rates[i]['close'] - rates[i]['open'])
-                    if move_down > body_size * 2:  # Impulsive move
-                        order_blocks.append({
-                            'type': 'BEARISH_OB',
-                            'time': int(rates[i]['time']),
-                            'high': float(rates[i]['high']),
-                            'low': float(rates[i]['low']),
-                            'open': float(rates[i]['open']),
-                            'close': float(rates[i]['close']),
-                            'mitigated': False
-                        })
-                        break
-    
-    return order_blocks
-
-
-def calculate_fibonacci_levels(swing_high, swing_low, direction='bullish'):
-    """Calculate Fibonacci retracement levels"""
-    if direction == 'bullish':
-        # For bullish fib, measure from swing low to swing high
-        diff = swing_high - swing_low
-        return {
-            '0.0': round(swing_low, 5),
-            '0.236': round(swing_low + diff * 0.236, 5),
-            '0.382': round(swing_low + diff * 0.382, 5),
-            '0.5': round(swing_low + diff * 0.5, 5),
-            '0.618': round(swing_low + diff * 0.618, 5),
-            '0.786': round(swing_low + diff * 0.786, 5),
-            '1.0': round(swing_high, 5),
-            '1.272': round(swing_high + diff * 0.272, 5),
-            '1.618': round(swing_high + diff * 0.618, 5),
-        }
-    else:
-        # For bearish fib, measure from swing high to swing low
-        diff = swing_high - swing_low
-        return {
-            '0.0': round(swing_high, 5),
-            '0.236': round(swing_high - diff * 0.236, 5),
-            '0.382': round(swing_high - diff * 0.382, 5),
-            '0.5': round(swing_high - diff * 0.5, 5),
-            '0.618': round(swing_high - diff * 0.618, 5),
-            '0.786': round(swing_high - diff * 0.786, 5),
-            '1.0': round(swing_low, 5),
-            '1.272': round(swing_low - diff * 0.272, 5),
-            '1.618': round(swing_low - diff * 0.618, 5),
-        }
-
-
-def generate_smc_signal(current_price, swing_highs, swing_lows, order_blocks, fib_levels, trend):
-    """Generate trading signal based on SMC analysis"""
-    signal = {
-        'action': 'WAIT',
-        'confidence': 0,
-        'reason': '',
-        'entry': None,
-        'sl': None,
-        'tp': None,
-        'rr': None
-    }
-    
-    if not swing_highs or not swing_lows or not order_blocks:
-        signal['reason'] = 'Insufficient data for SMC analysis'
-        return signal
-    
-    # Get recent swing points
-    last_swing_high = swing_highs[-1]['price'] if swing_highs else None
-    last_swing_low = swing_lows[-1]['price'] if swing_lows else None
-    
-    # Check for bullish setup
-    bullish_obs = [ob for ob in order_blocks if ob['type'] == 'BULLISH_OB']
-    bearish_obs = [ob for ob in order_blocks if ob['type'] == 'BEARISH_OB']
-    
-    # Bullish signal: Price near bullish OB + bullish trend + near fib 0.618/0.5
-    if bullish_obs and trend in ['UP', 'STRONG_UP']:
-        for ob in bullish_obs[-2:]:
-            ob_zone_top = ob['high']
-            ob_zone_bottom = ob['low']
-            ob_range = ob_zone_top - ob_zone_bottom
-            
-            # Check if price is in or APPROACHING the OB zone (within 1.5x of zone height)
-            zone_buffer = ob_range * 1.5  # 150% buffer for approaching
-            if ob_zone_bottom - zone_buffer <= current_price <= ob_zone_top * 1.01:
-                # Check if near fib 0.618 or 0.5
-                fib_618 = fib_levels.get('0.618', 0)
-                fib_5 = fib_levels.get('0.5', 0)
-                
-                near_fib = abs(current_price - fib_618) / current_price < 0.005 or \
-                          abs(current_price - fib_5) / current_price < 0.005
-                
-                confidence = 60
-                if near_fib:
-                    confidence += 25
-                if trend == 'STRONG_UP':
-                    confidence += 15
-                
-                sl_distance = current_price - ob_zone_bottom
-                tp_distance = sl_distance * 2  # 1:2 RR
-                
-                signal = {
-                    'action': 'BUY',
-                    'confidence': min(confidence, 95),
-                    'reason': f"Bullish OB + {'FIB confluence' if near_fib else 'Trend'} + {trend}",
-                    'entry': round(current_price, 5),
-                    'sl': round(ob_zone_bottom - sl_distance * 0.1, 5),
-                    'tp': round(current_price + tp_distance, 5),
-                    'rr': '1:2',
-                    'ob_zone': [ob_zone_bottom, ob_zone_top]
-                }
-                break
-    
-    # Bearish signal: Price near bearish OB + bearish trend + near fib 0.618/0.5
-    elif bearish_obs and trend in ['DOWN', 'STRONG_DOWN']:
-        for ob in bearish_obs[-2:]:
-            ob_zone_top = ob['high']
-            ob_zone_bottom = ob['low']
-            ob_range = ob_zone_top - ob_zone_bottom
-            
-            # Check if price is in or APPROACHING the OB zone (within 1.5x of zone height)
-            zone_buffer = ob_range * 1.5  # 150% buffer for approaching
-            if ob_zone_bottom * 0.99 <= current_price <= ob_zone_top + zone_buffer:
-                # Check if near fib 0.618 or 0.5
-                fib_618 = fib_levels.get('0.618', 0)
-                fib_5 = fib_levels.get('0.5', 0)
-                
-                near_fib = abs(current_price - fib_618) / current_price < 0.005 or \
-                          abs(current_price - fib_5) / current_price < 0.005
-                
-                confidence = 60
-                if near_fib:
-                    confidence += 25
-                if trend == 'STRONG_DOWN':
-                    confidence += 15
-                
-                sl_distance = ob_zone_top - current_price
-                tp_distance = sl_distance * 2  # 1:2 RR
-                
-                signal = {
-                    'action': 'SELL',
-                    'confidence': min(confidence, 95),
-                    'reason': f"Bearish OB + {'FIB confluence' if near_fib else 'Trend'} + {trend}",
-                    'entry': round(current_price, 5),
-                    'sl': round(ob_zone_top + sl_distance * 0.1, 5),
-                    'tp': round(current_price - tp_distance, 5),
-                    'rr': '1:2',
-                    'ob_zone': [ob_zone_bottom, ob_zone_top]
-                }
-                break
-    
-    # Fallback: Strong trend with good structure (lower confidence)
-    if signal['action'] == 'WAIT':
-        if trend == 'STRONG_UP' and bullish_obs and last_swing_low:
-            # Strong uptrend - give BUY signal with lower confidence
-            sl_distance = current_price - last_swing_low
-            tp_distance = sl_distance * 1.5  # 1:1.5 RR for trend trades
-            
-            signal = {
-                'action': 'BUY',
-                'confidence': 55,  # Lower confidence for trend-based entry
-                'reason': f"Strong uptrend + Bullish structure",
-                'entry': round(current_price, 5),
-                'sl': round(last_swing_low - sl_distance * 0.05, 5),
-                'tp': round(current_price + tp_distance, 5),
-                'rr': '1:1.5'
-            }
-        elif trend == 'STRONG_DOWN' and bearish_obs and last_swing_high:
-            # Strong downtrend - give SELL signal with lower confidence
-            sl_distance = last_swing_high - current_price
-            tp_distance = sl_distance * 1.5  # 1:1.5 RR for trend trades
-            
-            signal = {
-                'action': 'SELL',
-                'confidence': 55,  # Lower confidence for trend-based entry
-                'reason': f"Strong downtrend + Bearish structure",
-                'entry': round(current_price, 5),
-                'sl': round(last_swing_high + sl_distance * 0.05, 5),
-                'tp': round(current_price - tp_distance, 5),
-                'rr': '1:1.5'
-            }
-        else:
-            signal['reason'] = 'No valid SMC setup found - waiting for price to reach OB zone'
-    
-    return signal
-
-
-@app.route('/api/smc/<symbol>', methods=['GET'])
-def get_smc_analysis(symbol):
-    """Get Smart Money Concepts analysis: Swings, Order Blocks, Fibonacci, and Trade Signal"""
-    if not mt5.symbol_select(symbol, True):
-        return jsonify({"error": f"Symbol {symbol} not found"}), 404
-    
-    timeframe = request.args.get('timeframe', 'H1')
-    tf_map = {
-        'M1': mt5.TIMEFRAME_M1, 'M5': mt5.TIMEFRAME_M5, 'M15': mt5.TIMEFRAME_M15,
-        'M30': mt5.TIMEFRAME_M30, 'H1': mt5.TIMEFRAME_H1, 'H4': mt5.TIMEFRAME_H4,
-        'D1': mt5.TIMEFRAME_D1, 'W1': mt5.TIMEFRAME_W1
-    }
-    tf = tf_map.get(timeframe.upper(), mt5.TIMEFRAME_H1)
-    
-    # Get more candles for swing detection
-    rates = mt5.copy_rates_from_pos(symbol, tf, 0, 200)
-    if rates is None or len(rates) < 50:
-        return jsonify({"error": "Not enough data"}), 400
-    
-    # Convert to list of dicts
-    rates_list = [dict(zip(['time', 'open', 'high', 'low', 'close', 'tick_volume', 'spread', 'real_volume'], r)) for r in rates]
-    
-    # Get current price
-    tick = mt5.symbol_info_tick(symbol)
-    current_price = (tick.bid + tick.ask) / 2 if tick else rates_list[-1]['close']
-    
-    # Find swing points
-    swing_highs, swing_lows = find_swing_points(rates_list, lookback=3)
-    
-    # Find order blocks
-    order_blocks = find_order_blocks(rates_list, swing_highs, swing_lows)
-    
-    # Calculate Fibonacci levels from last major swing
-    fib_levels = {}
-    fib_direction = 'bullish'
-    if swing_highs and swing_lows:
-        last_high = swing_highs[-1]
-        last_low = swing_lows[-1]
-        
-        # Determine direction based on which came last
-        if last_high['index'] > last_low['index']:
-            # Swing high came after swing low - bullish move, expect retracement down
-            fib_direction = 'bearish'
-            fib_levels = calculate_fibonacci_levels(last_high['price'], last_low['price'], 'bearish')
-        else:
-            # Swing low came after swing high - bearish move, expect retracement up
-            fib_direction = 'bullish'
-            fib_levels = calculate_fibonacci_levels(last_high['price'], last_low['price'], 'bullish')
-    
-    # Get trend for signal generation
-    trend_data = {}
-    for tf_name, tf_val in [('H1', mt5.TIMEFRAME_H1), ('H4', mt5.TIMEFRAME_H4), ('D1', mt5.TIMEFRAME_D1)]:
-        tf_rates = mt5.copy_rates_from_pos(symbol, tf_val, 0, 20)
-        if tf_rates is not None:
-            tf_list = [dict(zip(['time', 'open', 'high', 'low', 'close', 'tick_volume', 'spread', 'real_volume'], r)) for r in tf_rates]
-            trend_data[tf_name] = calculate_trend(tf_list)
-    
-    overall_trend = determine_overall_trend(trend_data) if trend_data else 'NEUTRAL'
-    
-    # Generate trading signal
-    signal = generate_smc_signal(current_price, swing_highs, swing_lows, order_blocks, fib_levels, overall_trend)
-    
-    return jsonify({
-        "symbol": symbol,
-        "timeframe": timeframe,
-        "current_price": round(current_price, 5),
-        "swing_highs": swing_highs[-10:],  # Last 10 swing highs
-        "swing_lows": swing_lows[-10:],    # Last 10 swing lows
-        "order_blocks": order_blocks,
-        "fibonacci": {
-            "direction": fib_direction,
-            "levels": fib_levels
-        },
-        "trend": overall_trend,
-        "signal": signal
-    })
-
-
-@app.route('/api/smc/v2/<symbol>', methods=['GET'])
-def get_smc_analysis_v2(symbol):
-    """
-    Enhanced SMC analysis v2 using official documented SMC methodology:
-    
-    - Market Structure (HH/HL/LH/LL with proper labeling)
-    - Break of Structure (BOS) - continuation signals
-    - Change of Character (CHoCH) - reversal signals  
-    - Order Blocks (with mitigation status and BOS causation)
-    - Fair Value Gaps (FVG) with fill percentage
-    - Liquidity Zones (Equal Highs/Lows)
-    - Liquidity Sweeps detection
-    - Premium/Discount Zones with OTE levels
-    - Fibonacci retracement for Optimal Trade Entry
-    """
-    if not SMC_MODULE_LOADED:
-        return jsonify({"error": "SMC module not available - please ensure smc_analysis.py is in the same directory"}), 500
-    
-    if not mt5.symbol_select(symbol, True):
-        return jsonify({"error": f"Symbol {symbol} not found"}), 404
-    
-    timeframe = request.args.get('timeframe', 'H1')
-    tf_map = {
-        'M1': mt5.TIMEFRAME_M1, 'M5': mt5.TIMEFRAME_M5, 'M15': mt5.TIMEFRAME_M15,
-        'M30': mt5.TIMEFRAME_M30, 'H1': mt5.TIMEFRAME_H1, 'H4': mt5.TIMEFRAME_H4,
-        'D1': mt5.TIMEFRAME_D1, 'W1': mt5.TIMEFRAME_W1
-    }
-    tf = tf_map.get(timeframe.upper(), mt5.TIMEFRAME_H1)
-    
-    # Get candles for analysis
-    rates = mt5.copy_rates_from_pos(symbol, tf, 0, 200)
-    if rates is None or len(rates) < 50:
-        return jsonify({"error": "Not enough data"}), 400
-    
-    # Extract OHLC data
-    opens = [float(r['open']) for r in rates]
-    highs = [float(r['high']) for r in rates]
-    lows = [float(r['low']) for r in rates]
-    closes = [float(r['close']) for r in rates]
-    times = [datetime.fromtimestamp(r['time']).isoformat() for r in rates]
-    
-    # Get current price and symbol info
-    tick = mt5.symbol_info_tick(symbol)
-    current_price = (tick.bid + tick.ask) / 2 if tick else closes[-1]
-    symbol_info = mt5.symbol_info(symbol)
-    decimals = symbol_info.digits if symbol_info else 5
-    
-    # Run official SMC analysis
-    results = analyze_smc(opens, highs, lows, closes, times)
-    
-    # Add metadata
-    results["symbol"] = symbol
-    results["timeframe"] = timeframe
-    results["current_price"] = round(current_price, decimals)
-    results["analysis_version"] = "2.0.0"
-    results["methodology"] = "Official SMC"
-    
-    return jsonify(results)
-
-
-@app.route('/api/smc/reverse/<symbol>', methods=['GET'])
-def get_reverse_smc_analysis(symbol):
-    """
-    Reverse SMC Analysis - Contrarian Trading Strategy
-    
-    For traders who believe SMC is a trap used by institutions to hunt
-    retail traders' stop losses. This endpoint:
-    
-    1. Performs standard SMC analysis
-    2. REVERSES the signal direction (BUY → SELL, SELL → BUY)
-    3. SWAPS SL and TP (SMC's TP becomes your SL, SMC's SL becomes your TP)
-    
-    The theory: Institutions teach retail traders SMC concepts, then
-    deliberately hunt their predictable stop loss placements at Order Blocks,
-    FVG zones, and swing points before moving in the opposite direction.
-    
-    Use same parameters as /api/smc/v2/<symbol>:
-    - timeframe: M1, M5, M15, M30, H1, H4, D1, W1 (default: H1)
-    """
-    if not SMC_MODULE_LOADED:
-        return jsonify({"error": "SMC module not available - please ensure smc_analysis.py is in the same directory"}), 500
-    
-    if not mt5.symbol_select(symbol, True):
-        return jsonify({"error": f"Symbol {symbol} not found"}), 404
-    
-    timeframe = request.args.get('timeframe', 'H1')
-    tf_map = {
-        'M1': mt5.TIMEFRAME_M1, 'M5': mt5.TIMEFRAME_M5, 'M15': mt5.TIMEFRAME_M15,
-        'M30': mt5.TIMEFRAME_M30, 'H1': mt5.TIMEFRAME_H1, 'H4': mt5.TIMEFRAME_H4,
-        'D1': mt5.TIMEFRAME_D1, 'W1': mt5.TIMEFRAME_W1
-    }
-    tf = tf_map.get(timeframe.upper(), mt5.TIMEFRAME_H1)
-    
-    # Get candles for analysis
-    rates = mt5.copy_rates_from_pos(symbol, tf, 0, 200)
-    if rates is None or len(rates) < 50:
-        return jsonify({"error": "Not enough data"}), 400
-    
-    # Extract OHLC data
-    opens = [float(r['open']) for r in rates]
-    highs = [float(r['high']) for r in rates]
-    lows = [float(r['low']) for r in rates]
-    closes = [float(r['close']) for r in rates]
-    times = [datetime.fromtimestamp(r['time']).isoformat() for r in rates]
-    
-    # Get current price and symbol info
-    tick = mt5.symbol_info_tick(symbol)
-    current_price = (tick.bid + tick.ask) / 2 if tick else closes[-1]
-    symbol_info = mt5.symbol_info(symbol)
-    decimals = symbol_info.digits if symbol_info else 5
-    
-    # Run REVERSE SMC analysis (reverse=True)
-    results = analyze_smc(opens, highs, lows, closes, times, reverse=True)
-    
-    # Add metadata
-    results["symbol"] = symbol
-    results["timeframe"] = timeframe
-    results["current_price"] = round(current_price, decimals)
-    results["analysis_version"] = "2.0.0"
-    results["methodology"] = "Reverse SMC (Contrarian)"
-    results["description"] = "Trades AGAINST standard SMC signals - SL and TP are swapped"
-    
-    return jsonify(results)
-
-
-@app.route('/api/symbols/tradable', methods=['GET'])
-def get_tradable_symbols():
-    """Get list of commonly traded symbols with search support"""
-    search = request.args.get('search', '').upper()
-    limit = int(request.args.get('limit', 100))
-    
-    # Common trading symbols to prioritize
-    priority_base = ['XAUUSD', 'EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'USDCAD', 
-                     'USDCHF', 'NZDUSD', 'GBPJPY', 'EURJPY', 'EURGBP', 'AUDJPY',
-                     'XAGUSD', 'BTCUSD', 'ETHUSD', 'US30', 'US100', 'GER40', 'UK100']
-    
-    symbols = mt5.symbols_get()
-    if not symbols:
-        return jsonify({"symbols": [], "error": "Failed to get symbols"})
-    
-    result = []
-    seen = set()
-    
-    # Helper to add symbol with info
-    def add_symbol(s):
-        if s.name in seen or not s.visible:
-            return
-        
-        # Skip if not matching search
-        if search and search not in s.name.upper() and search not in (s.description or '').upper():
-            return
-        
-        seen.add(s.name)
-        result.append({
-            "symbol": s.name,
-            "description": s.description,
-            "bid": s.bid,
-            "ask": s.ask,
-            "digits": s.digits,
-            "category": get_symbol_category(s.name)
-        })
-    
-    # First add priority symbols
-    symbol_dict = {s.name: s for s in symbols}
-    for base in priority_base:
-        # Try exact match
-        if base in symbol_dict:
-            add_symbol(symbol_dict[base])
-        # Try with common suffixes
-        for suffix in ['.pr', '.m', '.r', '.pro', '.raw', '.std']:
-            key = base + suffix
-            if key in symbol_dict:
-                add_symbol(symbol_dict[key])
-    
-    # Then add remaining symbols
-    for s in symbols:
-        if len(result) >= limit:
-            break
-        add_symbol(s)
-    
-    return jsonify({
-        "symbols": result[:limit],
-        "count": len(result),
-        "total_available": len(symbols)
-    })
-
-def get_symbol_category(symbol):
-    """Categorize symbol for grouping"""
-    symbol = symbol.upper()
-    if 'XAU' in symbol or 'XAG' in symbol or 'GOLD' in symbol or 'SILVER' in symbol:
-        return 'Metals'
-    elif 'BTC' in symbol or 'ETH' in symbol or 'LTC' in symbol or 'CRYPTO' in symbol:
-        return 'Crypto'
-    elif any(idx in symbol for idx in ['US30', 'US100', 'US500', 'GER', 'UK100', 'JP225', 'DAX', 'NASDAQ', 'DOW']):
-        return 'Indices'
-    elif 'OIL' in symbol or 'WTI' in symbol or 'BRENT' in symbol or 'GAS' in symbol:
-        return 'Energy'
-    else:
-        return 'Forex'
-
-# ============== Profit Watchdog ==============
-import threading
-import time as time_module
-
-watchdog_config = {
-    "enabled": False,
-    "mode": "FIXED",      # FIXED or AUTO
-    "target_amount": 20,  # Target profit in account currency
-    "step": 1,            # Step for AUTO mode
-    "current_step": 0,    # Current step level for AUTO mode
-    "check_interval": 1,  # Seconds between checks
-    "magic": 0,           # 0 = all positions
-    "last_check": None,
-    "last_profit": 0,
-    "positions_closed": 0
-}
-
-watchdog_thread = None
-watchdog_running = False
-
-def watchdog_worker():
-    """Background worker that monitors floating profit and closes all trades when target is hit"""
-    global watchdog_running
-    print("[WATCHDOG] Worker started")
-    
-    while watchdog_running and watchdog_config["enabled"]:
-        try:
-            # Get all positions
-            if watchdog_config["magic"] > 0:
-                positions = mt5.positions_get(magic=watchdog_config["magic"])
-            else:
-                positions = mt5.positions_get()
-            
-            if positions is None or len(positions) == 0:
-                watchdog_config["last_profit"] = 0
-                time_module.sleep(watchdog_config["check_interval"])
-                continue
-            
-            # Calculate total floating profit
-            total_profit = sum(p.profit for p in positions)
-            watchdog_config["last_profit"] = total_profit
-            watchdog_config["last_check"] = datetime.now().isoformat()
-            
-            # Determine target based on mode
-            if watchdog_config["mode"] == "AUTO":
-                # In AUTO mode, target increases by step each time we hit it
-                target = watchdog_config["step"] * (watchdog_config["current_step"] + 1)
-            else:
-                target = watchdog_config["target_amount"]
-            
-            # Check if we hit the target
-            if total_profit >= target:
-                print(f"[WATCHDOG] 🎯 Target hit! Profit: ${total_profit:.2f} >= Target: ${target:.2f}")
-                print(f"[WATCHDOG] Closing {len(positions)} positions...")
-                
-                closed = 0
-                for pos in positions:
-                    # Close each position
-                    tick = mt5.symbol_info_tick(pos.symbol)
-                    if not tick:
-                        continue
-                    
-                    price = tick.bid if pos.type == mt5.ORDER_TYPE_BUY else tick.ask
-                    close_type = mt5.ORDER_TYPE_SELL if pos.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
-                    
-                    req = {
-                        "action": mt5.TRADE_ACTION_DEAL,
-                        "symbol": pos.symbol,
-                        "volume": pos.volume,
-                        "type": close_type,
-                        "position": pos.ticket,
-                        "price": price,
-                        "deviation": 20,
-                        "magic": pos.magic,
-                        "comment": f"Watchdog TP ${target:.2f}",
-                        "type_time": mt5.ORDER_TIME_GTC,
-                        "type_filling": mt5.ORDER_FILLING_IOC
-                    }
-                    
-                    result = mt5.order_send(req)
-                    if result and result.retcode == mt5.TRADE_RETCODE_DONE:
-                        closed += 1
-                        print(f"[WATCHDOG] ✅ Closed {pos.symbol} #{pos.ticket}")
-                    else:
-                        print(f"[WATCHDOG] ❌ Failed to close {pos.symbol} #{pos.ticket}")
-                
-                watchdog_config["positions_closed"] += closed
-                print(f"[WATCHDOG] Closed {closed}/{len(positions)} positions")
-                
-                # In AUTO mode, increment the step
-                if watchdog_config["mode"] == "AUTO":
-                    watchdog_config["current_step"] += 1
-                    print(f"[WATCHDOG] AUTO mode: Next target = ${watchdog_config['step'] * (watchdog_config['current_step'] + 1):.2f}")
-                else:
-                    # In FIXED mode, disable after hitting target
-                    watchdog_config["enabled"] = False
-                    print("[WATCHDOG] FIXED mode: Watchdog disabled after target hit")
+def find_order_blocks(bars: list[dict[str, Any]], swing_highs: list, swing_lows: list) -> list[dict[str, Any]]:
+    blocks: list[dict[str, Any]] = []
+    for swing in swing_lows[-6:]:
+        idx = swing["index"]
+        for i in range(idx - 1, max(0, idx - 6), -1):
+            if bars[i]["close"] < bars[i]["open"]:
+                move = bars[min(idx + 2, len(bars) - 1)]["close"] - bars[i]["low"]
+                body = abs(bars[i]["close"] - bars[i]["open"])
+                if move > body * 1.5:
+                    blocks.append({
+                        "type": "BULLISH_OB",
+                        "time": bars[i]["time"],
+                        "high": bars[i]["high"],
+                        "low": bars[i]["low"],
+                        "rsi_ob": False,
+                    })
                     break
-            
-        except Exception as e:
-            print(f"[WATCHDOG] Error: {e}")
-        
-        time_module.sleep(watchdog_config["check_interval"])
-    
-    print("[WATCHDOG] Worker stopped")
-    watchdog_running = False
+    for swing in swing_highs[-6:]:
+        idx = swing["index"]
+        for i in range(idx - 1, max(0, idx - 6), -1):
+            if bars[i]["close"] > bars[i]["open"]:
+                move = bars[i]["high"] - bars[min(idx + 2, len(bars) - 1)]["close"]
+                body = abs(bars[i]["close"] - bars[i]["open"])
+                if move > body * 1.5:
+                    blocks.append({
+                        "type": "BEARISH_OB",
+                        "time": bars[i]["time"],
+                        "high": bars[i]["high"],
+                        "low": bars[i]["low"],
+                        "rsi_ob": False,
+                    })
+                    break
+    return blocks
 
-@app.route('/api/watchdog/start', methods=['POST'])
-def start_watchdog():
-    """Start the profit watchdog"""
-    global watchdog_thread, watchdog_running
-    
-    data = request.json or {}
-    mode = data.get('mode', 'FIXED').upper()
-    
-    if mode == 'AUTO':
-        watchdog_config["mode"] = "AUTO"
-        watchdog_config["step"] = float(data.get('step', 1))
-        watchdog_config["current_step"] = 0
+
+def format_volume_k(volume: int | float) -> str:
+    """Format tick volume like stream overlays: 5200 → '5.2k'."""
+    v = float(volume)
+    if v >= 1_000_000:
+        return f"{v / 1_000_000:.1f}M".replace(".0M", "M")
+    if v >= 1000:
+        s = f"{v / 1000:.1f}k"
+        return s.replace(".0k", "k")
+    return str(int(v))
+
+
+def enrich_order_block_intensity(bars: list[dict[str, Any]], blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    RSI OB intensity — volume at OB candle (5k, 2.5k) + relative volume (2.5x avg).
+    Streams usually label OB strength by tick volume and how extreme RSI was.
+    """
+    time_to_idx = {b["time"]: i for i, b in enumerate(bars)}
+    all_vols = [b["volume"] for b in bars]
+
+    for ob in blocks:
+        idx = time_to_idx.get(ob["time"])
+        if idx is None:
+            continue
+
+        bar = bars[idx]
+        vol = int(bar.get("volume") or 0)
+        start = max(0, idx - 20)
+        window = all_vols[start:idx] or all_vols[max(0, idx - 5): idx + 1]
+        avg_vol = sum(window) / len(window) if window else max(vol, 1)
+        rel = vol / avg_vol if avg_vol else 1.0
+
+        rsi = float(ob.get("rsi") or 50)
+        if ob["type"] == "BULLISH_OB":
+            rsi_depth = max(0.0, 35.0 - rsi)
+        else:
+            rsi_depth = max(0.0, rsi - 65.0)
+
+        vol_score = min(100.0, rel * 25.0)
+        rsi_score = min(100.0, rsi_depth * 5.0)
+        intensity = round(min(100.0, vol_score * 0.65 + rsi_score * 0.35), 1)
+
+        if intensity >= 70:
+            tier = "HIGH"
+        elif intensity >= 40:
+            tier = "MED"
+        else:
+            tier = "LOW"
+
+        ob["volume"] = vol
+        ob["volume_k"] = format_volume_k(vol)
+        ob["volume_avg"] = round(avg_vol)
+        ob["volume_rel"] = round(rel, 2)
+        ob["volume_rel_label"] = f"{rel:.1f}x".replace(".0x", "x")
+        ob["rsi_depth"] = round(rsi_depth, 1)
+        ob["intensity"] = intensity
+        ob["intensity_tier"] = tier
+        ob["intensity_label"] = f"{format_volume_k(vol)} · {ob['volume_rel_label']}"
+
+    blocks.sort(key=lambda x: x.get("intensity", 0), reverse=True)
+    return blocks
+
+
+def mark_rsi_order_blocks(bars: list[dict[str, Any]], blocks: list[dict[str, Any]], period: int = 14) -> list[dict[str, Any]]:
+    """Flag OBs where RSI was oversold (bull) or overbought (bear) at formation."""
+    closes = [b["close"] for b in bars]
+    rsi = calc_rsi(closes, period)
+    if not rsi:
+        return blocks
+    rsi_offset = len(closes) - len(rsi)
+    time_to_idx = {b["time"]: i for i, b in enumerate(bars)}
+    for ob in blocks:
+        idx = time_to_idx.get(ob["time"])
+        if idx is None:
+            continue
+        ri = idx - rsi_offset
+        if ri < 0 or ri >= len(rsi):
+            continue
+        val = rsi[ri]
+        ob["rsi"] = round(val, 1)
+        if ob["type"] == "BULLISH_OB" and val <= 35:
+            ob["rsi_ob"] = True
+        if ob["type"] == "BEARISH_OB" and val >= 65:
+            ob["rsi_ob"] = True
+    return blocks
+
+
+def analyze_timeframe(sym: str, tf_key: str, count: int = 120) -> dict[str, Any]:
+    tf = TIMEFRAMES.get(tf_key)
+    if tf is None:
+        return {"timeframe": tf_key, "trend": "NEUTRAL", "rsi": None}
+    rates = mt5.copy_rates_from_pos(sym, tf, 0, count)
+    if rates is None or len(rates) == 0:
+        return {"timeframe": tf_key, "trend": "NEUTRAL", "rsi": None}
+    bars = rates_to_bars(rates)
+    closes = [b["close"] for b in bars]
+    rsi_vals = calc_rsi(closes)
+    ema20 = calc_ema(closes, 20)
+    ema50 = calc_ema(closes, 50)
+    return {
+        "timeframe": tf_key,
+        "trend": calculate_trend(bars),
+        "rsi": round(rsi_vals[-1], 1) if rsi_vals else None,
+        "rsi_signal": (
+            "oversold" if rsi_vals and rsi_vals[-1] < 30 else
+            "overbought" if rsi_vals and rsi_vals[-1] > 70 else
+            "neutral"
+        ),
+        "ema20": round(ema20[-1], 5) if ema20 else None,
+        "ema50": round(ema50[-1], 5) if ema50 else None,
+        "close": closes[-1],
+    }
+
+
+def build_chart_analysis(sym: str, chart_tf: str, count: int = 200) -> dict[str, Any]:
+    chart_tf = chart_tf.upper()
+    tf = TIMEFRAMES.get(chart_tf, mt5.TIMEFRAME_M5)
+    rates = mt5.copy_rates_from_pos(sym, tf, 0, count)
+    if rates is None or len(rates) == 0:
+        return {"ok": False, "error": "no candle data"}
+
+    bars = rates_to_bars(rates)
+    closes = [b["close"] for b in bars]
+    highs = [b["high"] for b in bars]
+    lows = [b["low"] for b in bars]
+    rsi_series = calc_rsi(closes)
+    rsi_offset = len(closes) - len(rsi_series)
+    rsi_points = [
+        {"time": datetime.utcfromtimestamp(bars[rsi_offset + i]["time"]).isoformat() + "Z", "rsi": round(rsi_series[i], 2)}
+        for i in range(len(rsi_series))
+    ]
+
+    ema20 = calc_ema(closes, 20)
+    ema50 = calc_ema(closes, 50)
+    ema20_pts, ema50_pts = [], []
+    for i, val in enumerate(ema20):
+        t = bars[i + (len(closes) - len(ema20))]["time"]
+        ema20_pts.append({"time": datetime.utcfromtimestamp(t).isoformat() + "Z", "value": round(val, 5)})
+    for i, val in enumerate(ema50):
+        t = bars[i + (len(closes) - len(ema50))]["time"]
+        ema50_pts.append({"time": datetime.utcfromtimestamp(t).isoformat() + "Z", "value": round(val, 5)})
+
+    swing_h, swing_l = find_swing_points(bars)
+    order_blocks = find_order_blocks(bars, swing_h, swing_l)
+    order_blocks = mark_rsi_order_blocks(bars, order_blocks)
+    order_blocks = enrich_order_block_intensity(bars, order_blocks)
+
+    for ob in order_blocks:
+        ob["time"] = datetime.utcfromtimestamp(ob["time"]).isoformat() + "Z"
+
+    mtf = {tf_key: analyze_timeframe(sym, tf_key) for tf_key in ("M1", "M5", "M15", "M30")}
+    trends = {k: v["trend"] for k, v in mtf.items()}
+    up = sum(1 for t in trends.values() if t == "UP")
+    down = sum(1 for t in trends.values() if t == "DOWN")
+    if up >= 3:
+        overall = "STRONG_UP"
+    elif down >= 3:
+        overall = "STRONG_DOWN"
+    elif up > down:
+        overall = "UP"
+    elif down > up:
+        overall = "DOWN"
     else:
-        watchdog_config["mode"] = "FIXED"
-        watchdog_config["target_amount"] = float(data.get('amount', 20))
-    
-    watchdog_config["magic"] = int(data.get('magic', 0))
-    watchdog_config["check_interval"] = float(data.get('interval', 1))
-    watchdog_config["enabled"] = True
-    watchdog_config["positions_closed"] = 0
-    
-    # Start worker thread if not running
-    if not watchdog_running:
-        watchdog_running = True
-        watchdog_thread = threading.Thread(target=watchdog_worker, daemon=True)
-        watchdog_thread.start()
-    
-    target = watchdog_config["step"] if mode == "AUTO" else watchdog_config["target_amount"]
-    
-    return jsonify({
+        overall = "NEUTRAL"
+
+    tick = mt5.symbol_info_tick(sym)
+    return {
         "ok": True,
-        "status": "running",
-        "mode": watchdog_config["mode"],
-        "target": target,
-        "message": f"Watchdog started in {mode} mode, target: ${target:.2f}"
-    })
+        "symbol": sym,
+        "chart_timeframe": chart_tf,
+        "price": tick.bid if tick else closes[-1],
+        "overall_trend": overall,
+        "mtf": mtf,
+        "chart": {
+            "trend": calculate_trend(bars),
+            "rsi": round(rsi_series[-1], 1) if rsi_series else None,
+            "rsi_signal": mtf.get(chart_tf, {}).get("rsi_signal"),
+            "atr": round(
+                sum(max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1]))
+                    for i in range(1, min(15, len(closes)))) / 14,
+                2,
+            ) if len(closes) > 14 else None,
+        },
+        "rsi_series": rsi_points[-80:],
+        "ema20": ema20_pts[-80:],
+        "ema50": ema50_pts[-80:],
+        "order_blocks": order_blocks,
+        "rsi_order_blocks": [ob for ob in order_blocks if ob.get("rsi_ob")],
+        "strongest_rsi_ob": next(
+            (ob for ob in order_blocks if ob.get("rsi_ob")),
+            None,
+        ),
+        "swing_highs": [
+            {"time": datetime.utcfromtimestamp(s["time"]).isoformat() + "Z", "price": s["price"]}
+            for s in swing_h[-8:]
+        ],
+        "swing_lows": [
+            {"time": datetime.utcfromtimestamp(s["time"]).isoformat() + "Z", "price": s["price"]}
+            for s in swing_l[-8:]
+        ],
+    }
 
-@app.route('/api/watchdog/stop', methods=['POST'])
-def stop_watchdog():
-    """Stop the profit watchdog"""
-    global watchdog_running
-    
-    watchdog_config["enabled"] = False
-    watchdog_running = False
-    
-    return jsonify({
-        "ok": True,
-        "status": "stopped",
-        "positions_closed": watchdog_config["positions_closed"],
-        "message": "Watchdog stopped"
-    })
 
-@app.route('/api/watchdog/status', methods=['GET'])
-def watchdog_status():
-    """Get watchdog status"""
-    # Get current floating profit
-    positions = mt5.positions_get()
-    current_profit = sum(p.profit for p in positions) if positions else 0
-    
-    if watchdog_config["mode"] == "AUTO":
-        next_target = watchdog_config["step"] * (watchdog_config["current_step"] + 1)
+@app.route("/getAnalysis", methods=["GET"])
+@require_api_key
+@require_mt5
+def get_analysis():
+    """
+    Multi-TF trend LEDs, RSI, order blocks for chart overlays.
+    ?symbol=XAUUSD&timeframe=M5&count=200
+    """
+    symbol = request.args.get("symbol", "").strip()
+    if not symbol:
+        return jsonify({"ok": False, "error": "symbol required"}), 400
+    chart_tf = request.args.get("timeframe", "M5").upper()
+    count = max(50, min(int(request.args.get("count", 200)), 5000))
+    info, sym = resolve_symbol(symbol)
+    if info is None:
+        return jsonify({"ok": False, "error": f"symbol not found: {symbol}"}), 404
+    result = build_chart_analysis(sym, chart_tf, count)
+    return jsonify(result), (200 if result.get("ok") else 400)
+
+
+def _execute_place_order(data: dict[str, Any]) -> tuple[dict[str, Any], int]:
+    symbol = data.get("symbol")
+    if not symbol:
+        return {"ok": False, "error": "symbol required"}, 400
+
+    order_type = str(data.get("type", "buy")).lower()
+    volume = float(data.get("volume", 0.01))
+    magic = int(data.get("magic", DEFAULT_MAGIC))
+    comment = str(data.get("comment", "API"))
+    deviation = int(data.get("deviation", 50))
+    sl = float(data.get("sl", 0) or 0)
+    tp = float(data.get("tp", 0) or 0)
+    sl_points = data.get("sl_points")
+    tp_points = data.get("tp_points")
+    price = data.get("price")
+
+    if order_type in ("buy", "sell"):
+        req, err = build_market_request(symbol, order_type, volume, magic=magic, comment=comment, deviation=deviation)
+        if err:
+            return {"ok": False, "error": err}, 400
+        entry = req["price"]
+        if sl_points is not None or tp_points is not None:
+            slp = int(sl_points) if sl_points is not None else None
+            tpp = int(tp_points) if tp_points is not None else None
+            sl, tp = apply_points_to_prices(req["symbol"], order_type, entry, slp, tpp)
+        if sl:
+            req["sl"] = sl
+        if tp:
+            req["tp"] = tp
     else:
-        next_target = watchdog_config["target_amount"]
-    
-    return jsonify({
-        "enabled": watchdog_config["enabled"],
-        "mode": watchdog_config["mode"],
-        "target_amount": watchdog_config["target_amount"],
-        "step": watchdog_config["step"],
-        "current_step": watchdog_config["current_step"],
-        "next_target": next_target,
-        "floating_profit": round(current_profit, 2),
-        "last_check": watchdog_config["last_check"],
-        "positions_closed": watchdog_config["positions_closed"],
-        "open_positions": len(positions) if positions else 0
-    })
+        if price is None:
+            return {"ok": False, "error": "price required for pending orders"}, 400
+        req, err = build_pending_request(symbol, order_type, volume, float(price), sl=sl, tp=tp, magic=magic, comment=comment)
+        if err:
+            return {"ok": False, "error": err}, 400
+        if sl_points is not None or tp_points is not None:
+            slp = int(sl_points) if sl_points is not None else None
+            tpp = int(tp_points) if tp_points is not None else None
+            sl, tp = apply_points_to_prices(req["symbol"], order_type, float(price), slp, tpp)
+            if sl:
+                req["sl"] = sl
+            if tp:
+                req["tp"] = tp
 
-# Legacy endpoints for GUI
-@app.route('/api/start_watchdog', methods=['POST'])
-def legacy_start_watchdog():
-    """Legacy endpoint for GUI"""
-    return start_watchdog()
-
-@app.route('/api/stop_watchdog', methods=['POST'])
-def legacy_stop_watchdog():
-    """Legacy endpoint for GUI"""
-    return stop_watchdog()
-
-@app.route('/api/watchdog_stats', methods=['GET'])
-def legacy_watchdog_stats():
-    """Legacy endpoint for GUI - returns stats in old format"""
-    status = watchdog_status().get_json()
-    return jsonify({
-        "cpu": "N/A",
-        "memory": "N/A",
-        "floating_profit": f"${status['floating_profit']:.2f}",
-        "status": "enabled" if status["enabled"] else "disabled",
-        "target": status["next_target"],
-        "mode": status["mode"]
-    })
+    ok, result = send_order(req)
+    if ok:
+        return {"ok": True, "request": {k: req[k] for k in req if k != "type_filling"}, "result": result_to_dict(result)}, 200
+    return {"ok": False, "result": result_to_dict(result), **last_error()}, 400
 
 
-# ============== Legacy Endpoints for GUI Compatibility ==============
-@app.route('/balance', methods=['GET'])
-def legacy_balance():
-    """Legacy endpoint for old GUI - redirects to /api/account"""
-    return account_info()
+@app.route("/placeOrder", methods=["POST"])
+@require_api_key
+@require_mt5
+def place_order():
+    payload, status = _execute_place_order(json_body())
+    return jsonify(payload), status
 
-@app.route('/positions', methods=['GET'])
-def legacy_positions():
-    """Legacy endpoint for old GUI - redirects to /api/positions"""
-    return get_positions()
 
-@app.route('/history', methods=['GET'])
-def legacy_history():
-    """Legacy endpoint for old GUI - adapts date range to days"""
-    start = request.args.get('start')
-    end = request.args.get('end')
-    
-    # Convert date range to days
-    days = 30  # default
-    if start and end:
-        try:
-            start_dt = datetime.strptime(start, '%Y-%m-%d')
-            end_dt = datetime.strptime(end, '%Y-%m-%d')
-            days = max(1, (datetime.now() - start_dt).days + 1)
-        except:
-            pass
-    
-    symbol = request.args.get('symbol')
-    from_dt = datetime.now() - timedelta(days=days)
-    to_dt = datetime.now()
-    
-    if symbol:
-        deals = mt5.history_deals_get(from_dt, to_dt, group=f"*{symbol}*")
+@app.route("/placeTrades", methods=["POST"])
+@require_api_key
+@require_mt5
+def place_trades():
+    trades = json_body().get("trades") or []
+    if not trades:
+        return jsonify({"ok": False, "error": "trades array required"}), 400
+    results = []
+    for i, t in enumerate(trades):
+        payload, status = _execute_place_order(t)
+        results.append({"index": i, "status": status, **payload})
+    ok_count = sum(1 for r in results if r.get("ok"))
+    return jsonify({"ok": ok_count > 0, "placed": ok_count, "total": len(trades), "results": results})
+
+
+@app.route("/getPositions", methods=["GET"])
+@require_api_key
+@require_mt5
+def get_positions():
+    symbol = request.args.get("symbol")
+    ticket = request.args.get("ticket")
+    magic = request.args.get("magic")
+
+    if ticket:
+        positions = mt5.positions_get(ticket=int(ticket))
+    elif symbol:
+        _, sym = resolve_symbol(symbol)
+        positions = mt5.positions_get(symbol=sym)
     else:
-        deals = mt5.history_deals_get(from_dt, to_dt)
-    
-    if deals is None:
-        return jsonify({"trades": [], "error": err()})
-    
-    # Format for GUI compatibility
-    trades = []
-    for d in deals:
-        if d.entry == 1:  # Only OUT deals (closed trades)
-            trades.append({
-                "ticket": d.ticket,
-                "symbol": d.symbol,
-                "type": "buy" if d.type == 0 else "sell",
-                "volume": d.volume,
-                "price": d.price,
-                "profit": d.profit,
-                "time": datetime.fromtimestamp(d.time).isoformat(),
-                "comment": d.comment
-            })
-    
-    return jsonify({"trades": trades, "count": len(trades)})
+        positions = mt5.positions_get()
 
-@app.route('/', methods=['GET'])
-def home():
-    return jsonify({
-        "name": "MT5 REST API Server",
-        "version": "2.1.0",
-        "endpoints": {
-            "Connection": [
-                "POST /api/init", "POST /api/shutdown", "GET /api/status", "GET /api/version",
-                "POST /api/invoke/trade", "POST /api/invoke/close", "POST /api/invoke/account",
-            ],
-            "Account": ["GET /api/account"],
-            "Symbols": ["GET /api/symbols", "GET /api/symbols/tradable?search=&limit=100", "GET /api/symbol/<symbol>", "POST /api/symbol/<symbol>/select"],
-            "Trend": ["GET /api/trend/<symbol>"],
-            "Price": ["GET /api/price/<symbol>", "GET /api/tick/<symbol>"],
-            "Candles": ["GET /api/candles/<symbol>?timeframe=H1&count=100"],
-            "Indicators": [
-                "GET /api/indicator/rsi/<symbol>?period=14&timeframe=H1&count=100",
-                "GET /api/indicator/ma/<symbol>?type=sma|ema|smma|lwma&period=14&applied=close",
-                "GET /api/indicator/macd/<symbol>?fast=12&slow=26&signal=9",
-                "GET /api/indicator/bollinger/<symbol>?period=20&std_dev=2",
-                "GET /api/indicator/stochastic/<symbol>?k_period=14&d_period=3",
-                "GET /api/indicator/atr/<symbol>?period=14",
-                "GET /api/indicator/cci/<symbol>?period=20",
-                "GET /api/indicator/williams/<symbol>?period=14",
-                "GET /api/indicator/momentum/<symbol>?period=10"
-            ],
-            "Trading": [
-                "POST /api/trade/open {symbol,type,volume,sl,tp,sl_points,tp_points,price,magic,comment}",
-                "POST /api/trade/close {ticket,volume}",
-                "POST /api/trade/close_all {symbol,magic}",
-                "POST /api/trade/modify {ticket,sl,tp,sl_points,tp_points}",
-                "POST /api/order/cancel {ticket}"
-            ],
-            "Trailing Stop": [
-                "POST /api/trailing/set {points, magic}",
-                "POST /api/trailing/disable",
-                "GET /api/trailing/status",
-                "POST /api/trailing/apply"
-            ],
-            "Positions": ["GET /api/positions?symbol=&ticket=&magic=", "GET /api/orders"],
-            "History": ["GET /api/history/deals?days=30&symbol=", "GET /api/history/orders?days=30"],
-            "Utilities": ["POST /api/calc/margin", "POST /api/calc/profit", "GET /api/market/book/<symbol>"],
-            "Legacy (GUI)": ["GET /balance", "GET /positions", "GET /history", "POST /set_trailing_sl", "POST /disable_trailing_sl", "GET /trailing_status"]
+    if positions is None:
+        return jsonify({"ok": False, **last_error()}), 400
+
+    rows = [pos_to_dict(p) for p in positions]
+    if magic is not None:
+        rows = [p for p in rows if p["magic"] == int(magic)]
+
+    return jsonify({"ok": True, "count": len(rows), "total_profit": sum(p["profit"] for p in rows), "positions": rows})
+
+
+@app.route("/closePositions", methods=["POST"])
+@require_api_key
+@require_mt5
+def close_positions():
+    data = json_body()
+    ticket, symbol, magic, volume = data.get("ticket"), data.get("symbol"), data.get("magic"), data.get("volume")
+
+    if ticket:
+        positions = mt5.positions_get(ticket=int(ticket))
+    elif symbol:
+        _, sym = resolve_symbol(symbol)
+        positions = mt5.positions_get(symbol=sym)
+    else:
+        positions = mt5.positions_get()
+
+    if not positions:
+        return jsonify({"ok": True, "closed": 0, "message": "no positions"})
+
+    if magic is not None:
+        positions = [p for p in positions if p.magic == int(magic)]
+
+    results = []
+    for pos in positions:
+        tick = mt5.symbol_info_tick(pos.symbol)
+        if not tick:
+            results.append({"ticket": pos.ticket, "ok": False, "error": "no tick"})
+            continue
+        close_vol = normalize_volume(pos.symbol, float(volume) if volume else pos.volume)
+        close_type = mt5.ORDER_TYPE_SELL if pos.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
+        close_price = tick.bid if pos.type == mt5.ORDER_TYPE_BUY else tick.ask
+        req = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": pos.symbol,
+            "volume": close_vol,
+            "type": close_type,
+            "position": pos.ticket,
+            "price": close_price,
+            "deviation": int(data.get("deviation", 50)),
+            "comment": str(data.get("comment", "API close")),
+            "type_time": mt5.ORDER_TIME_GTC,
         }
+        ok, res = send_order(req)
+        results.append({"ticket": pos.ticket, "ok": ok, "result": result_to_dict(res)})
+
+    closed = sum(1 for r in results if r["ok"])
+    return jsonify({"ok": closed > 0, "closed": closed, "results": results})
+
+
+@app.route("/modifyPosition", methods=["POST"])
+@require_api_key
+@require_mt5
+def modify_position():
+    data = json_body()
+    ticket = data.get("ticket")
+    if not ticket:
+        return jsonify({"ok": False, "error": "ticket required"}), 400
+
+    positions = mt5.positions_get(ticket=int(ticket))
+    if not positions:
+        return jsonify({"ok": False, "error": "position not found"}), 404
+
+    pos = positions[0]
+    new_sl, new_tp = pos.sl, pos.tp
+    side = "buy" if pos.type == mt5.ORDER_TYPE_BUY else "sell"
+
+    if "sl_points" in data:
+        sp = int(data["sl_points"])
+        if sp < 0:
+            new_sl = 0.0
+        elif sp == 0:
+            new_sl = pos.sl
+        else:
+            new_sl, _ = apply_points_to_prices(pos.symbol, side, pos.price_open, sp, None)
+    elif "sl" in data:
+        new_sl = float(data["sl"])
+
+    if "tp_points" in data:
+        tp = int(data["tp_points"])
+        if tp < 0:
+            new_tp = 0.0
+        elif tp == 0:
+            new_tp = pos.tp
+        else:
+            _, new_tp = apply_points_to_prices(pos.symbol, side, pos.price_open, None, tp)
+    elif "tp" in data:
+        new_tp = float(data["tp"])
+
+    new_sl = round_price(pos.symbol, new_sl) if new_sl else 0.0
+    new_tp = round_price(pos.symbol, new_tp) if new_tp else 0.0
+
+    ok, result = send_order({
+        "action": mt5.TRADE_ACTION_SLTP,
+        "symbol": pos.symbol,
+        "position": pos.ticket,
+        "sl": new_sl,
+        "tp": new_tp,
+    })
+    if ok:
+        return jsonify({"ok": True, "ticket": pos.ticket, "sl": new_sl, "tp": new_tp, "result": result_to_dict(result)})
+    return jsonify({"ok": False, "result": result_to_dict(result), **last_error()}), 400
+
+
+@app.route("/trailPosition_MODE1", methods=["POST"])
+@require_api_key
+@require_mt5
+def trail_mode1():
+    data = json_body()
+    ticket = data.get("ticket")
+    trail_pts = data.get("trail_points") or data.get("step_points")
+    if not ticket or trail_pts is None:
+        return jsonify({"ok": False, "error": "ticket and trail_points required"}), 400
+    result = trail_mgr.add_mode1(int(ticket), int(trail_pts))
+    return jsonify(result), (200 if result.get("ok") else 400)
+
+
+@app.route("/trailPosition_MODE2", methods=["POST"])
+@require_api_key
+@require_mt5
+def trail_mode2():
+    data = json_body()
+    ticket = data.get("ticket")
+    step_pts = data.get("step_points") or data.get("trail_points")
+    if not ticket or step_pts is None:
+        return jsonify({"ok": False, "error": "ticket and step_points required"}), 400
+    result = trail_mgr.add_mode2(int(ticket), int(step_pts))
+    return jsonify(result), (200 if result.get("ok") else 400)
+
+
+@app.route("/trail/stop", methods=["POST"])
+@require_api_key
+def trail_stop():
+    data = json_body()
+    ticket = data.get("ticket")
+    if ticket:
+        return jsonify({"ok": trail_mgr.remove(int(ticket)), "ticket": int(ticket)})
+    for job in trail_mgr.status():
+        trail_mgr.remove(job["ticket"])
+    return jsonify({"ok": True, "message": "all trail jobs stopped"})
+
+
+@app.route("/trail/status", methods=["GET"])
+@require_api_key
+def trail_status():
+    return jsonify({"ok": True, "jobs": trail_mgr.status()})
+
+
+@app.route("/placeGrid", methods=["POST"])
+@require_api_key
+@require_mt5
+def place_grid():
+    data = json_body()
+    symbol = data.get("symbol")
+    if not symbol:
+        return jsonify({"ok": False, "error": "symbol required"}), 400
+
+    magic = int(data.get("magic", 78001))
+    max_profit = float(data.get("max_floating_profit") or data.get("floating_profit") or 0)
+    basket_tp = float(
+        data.get("basket_tp_profit") or data.get("basket_tp") or max_profit or 0
+    )
+    basket_sl = float(
+        data.get("basket_sl_loss") or data.get("basket_sl") or data.get("target_loss") or basket_tp or 0
+    )
+
+    result = place_grid_fast(
+        symbol=symbol,
+        lot=float(data.get("lot", 0.01)),
+        distance=int(data.get("distance", 100)),
+        initial_distance=int(data.get("initial_distance", 200)),
+        orders_quantity=int(data.get("orders_quantity", 50)),
+        incremental=bool(data.get("incremental", False)),
+        magic=magic,
+        anchor=float(data["anchor"]) if data.get("anchor") else None,
+    )
+
+    if result.get("ok") and max_profit > 0:
+        guard = grid_guard.add(
+            symbol=result.get("symbol", symbol),
+            magic=magic,
+            max_floating_profit=max_profit,
+        )
+        result["grid_guard"] = guard
+
+    if result.get("ok") and basket_tp > 0:
+        result["basket_tp"] = basket_tp_mgr.add(
+            symbol=result.get("symbol", symbol),
+            magic=magic,
+            target_profit=basket_tp,
+            target_loss=basket_sl if basket_sl > 0 else None,
+        )
+
+    return jsonify(result), (200 if result.get("ok") else 400)
+
+
+@app.route("/gridGuard/start", methods=["POST"])
+@require_api_key
+@require_mt5
+def grid_guard_start():
+    """
+    Monitor basket floating profit and auto-close all positions + pending orders.
+    Body: symbol, magic, max_floating_profit (e.g. 2 = close at +$2)
+    """
+    data = json_body()
+    symbol = data.get("symbol")
+    if not symbol:
+        return jsonify({"ok": False, "error": "symbol required"}), 400
+    magic = int(data.get("magic", 78001))
+    max_profit = float(data.get("max_floating_profit") or data.get("floating_profit") or 0)
+    result = grid_guard.add(symbol, magic, max_profit)
+    return jsonify(result), (200 if result.get("ok") else 400)
+
+
+@app.route("/gridGuard/stop", methods=["POST"])
+@require_api_key
+def grid_guard_stop():
+    data = json_body()
+    symbol = data.get("symbol")
+    magic = data.get("magic")
+    if symbol and magic is not None:
+        removed = grid_guard.remove(symbol, int(magic))
+    else:
+        removed = grid_guard.remove()
+    return jsonify({"ok": True, "removed": removed})
+
+
+@app.route("/gridGuard/status", methods=["GET"])
+@require_api_key
+def grid_guard_status():
+    symbol = request.args.get("symbol")
+    magic = request.args.get("magic")
+    floating = None
+    if symbol:
+        _, sym = resolve_symbol(symbol)
+        floating = get_basket_floating(sym, int(magic) if magic else None)
+    return jsonify({
+        "ok": True,
+        "guards": grid_guard.status(),
+        "floating": floating,
     })
 
-def auto_init_mt5():
-    """Auto-initialize MT5 connection on startup"""
-    import time
-    time.sleep(2)  # Wait for Flask to start
-    
-    for attempt in range(5):
-        try:
-            if mt5.initialize():
-                account = mt5.account_info()
-                if account:
-                    print(f"✅ MT5 Auto-connected: Account {account.login}")
-                    return True
-                else:
-                    print(f"⏳ Attempt {attempt+1}: MT5 initialized but no account")
-            else:
-                error = mt5.last_error()
-                print(f"⏳ Attempt {attempt+1}: {error}")
-        except Exception as e:
-            print(f"⏳ Attempt {attempt+1}: {e}")
-        time.sleep(3)
-    
-    print("⚠️ MT5 auto-init failed - will connect when /api/init is called")
-    return False
 
-if __name__ == '__main__':
-    print("=" * 60)
-    print("MT5 REST API Server v2.0")
-    print("=" * 60)
-    print("Server: http://0.0.0.0:5000")
-    print("Docs:   http://localhost:5000/")
-    print("=" * 60)
-    
-    # Start auto-init in background thread
-    import threading
-    init_thread = threading.Thread(target=auto_init_mt5, daemon=True)
-    init_thread.start()
-    
-    app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
+@app.route("/closeGridBasket", methods=["POST"])
+@require_api_key
+@require_mt5
+def close_grid_basket():
+    """Manually close all positions + cancel pending orders for symbol/magic."""
+    data = json_body()
+    symbol = data.get("symbol")
+    magic = data.get("magic")
+    sym = None
+    if symbol:
+        _, sym = resolve_symbol(symbol)
+    result = close_basket(sym, int(magic) if magic is not None else None)
+    if symbol and magic is not None:
+        grid_guard.remove(symbol, int(magic))
+        basket_tp_mgr.remove(symbol, int(magic))
+    return jsonify(result)
+
+
+@app.route("/basketTp/start", methods=["POST"])
+@require_api_key
+@require_mt5
+def basket_tp_start():
+    """
+    Auto-set buy/sell TP+SL so basket hits +target_profit / -target_loss.
+    Keeps recalculating as new grid positions open.
+    Body: symbol, magic, target_profit, target_loss (optional, defaults to target_profit)
+    """
+    data = json_body()
+    symbol = data.get("symbol")
+    if not symbol:
+        return jsonify({"ok": False, "error": "symbol required"}), 400
+    magic = int(data.get("magic", 78001))
+    target = float(data.get("target_profit") or data.get("basket_tp_profit") or data.get("basket_tp") or 0)
+    target_loss = float(
+        data.get("target_loss") or data.get("basket_sl_loss") or data.get("basket_sl") or target
+    )
+    result = basket_tp_mgr.add(symbol, magic, target, target_loss)
+    return jsonify(result), (200 if result.get("ok") else 400)
+
+
+@app.route("/basketTp/stop", methods=["POST"])
+@require_api_key
+def basket_tp_stop():
+    data = json_body()
+    symbol = data.get("symbol")
+    magic = data.get("magic")
+    if symbol and magic is not None:
+        removed = basket_tp_mgr.remove(symbol, int(magic))
+    else:
+        removed = basket_tp_mgr.remove()
+    return jsonify({"ok": True, "removed": removed})
+
+
+@app.route("/basketTp/status", methods=["GET"])
+@require_api_key
+def basket_tp_status():
+    symbol = request.args.get("symbol")
+    magic = request.args.get("magic")
+    levels = None
+    if symbol:
+        _, sym = resolve_symbol(symbol)
+        positions = get_basket_positions(sym, int(magic) if magic else None)
+        jobs = basket_tp_mgr.status()
+        target = None
+        target_loss = None
+        if magic and jobs:
+            for j in jobs:
+                if j["symbol"] == sym and j["magic"] == int(magic):
+                    target = j["target_profit"]
+                    target_loss = j.get("target_loss")
+                    break
+        if positions and target:
+            levels = calc_basket_sltp_levels(positions, target, target_loss)
+        elif positions:
+            levels = {"positions_count": len(positions), "current_floating": get_basket_floating(sym, int(magic) if magic else None)}
+    return jsonify({
+        "ok": True,
+        "jobs": basket_tp_mgr.status(),
+        "levels": levels,
+    })
+
+
+@app.route("/basketTp/apply", methods=["POST"])
+@require_api_key
+@require_mt5
+def basket_tp_apply():
+    """One-shot: recalculate and apply basket TP+SL without starting background job."""
+    data = json_body()
+    symbol = data.get("symbol")
+    if not symbol:
+        return jsonify({"ok": False, "error": "symbol required"}), 400
+    magic = int(data.get("magic", 78001))
+    target = float(data.get("target_profit") or data.get("basket_tp_profit") or data.get("basket_tp") or 0)
+    target_loss = float(
+        data.get("target_loss") or data.get("basket_sl_loss") or data.get("basket_sl") or target
+    )
+    if target <= 0:
+        return jsonify({"ok": False, "error": "target_profit must be > 0"}), 400
+    _, sym = resolve_basket_symbol(symbol, magic)
+    if not sym or mt5.symbol_info(sym) is None:
+        return jsonify({"ok": False, "error": f"symbol not found: {symbol}"}), 400
+    result = apply_basket_sltp(sym, magic, target, target_loss)
+    levels = calc_basket_sltp_levels(get_basket_positions(sym, magic), target, target_loss)
+    result["levels"] = levels
+    return jsonify(result), (200 if result.get("ok") else 400)
+
+
+if __name__ == "__main__":
+    ok, msg = ensure_mt5(MT5_PATH or None)
+    print(f"[MT5] {msg}")
+    print(f"[MT5] API key: {API_KEY} | listening on port {PORT}")
+    trail_mgr.start()
+    grid_guard.start()
+    basket_tp_mgr.start()
+    app.run(host=HOST, port=PORT, threaded=True)
