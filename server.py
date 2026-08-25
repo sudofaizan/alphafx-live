@@ -13,6 +13,9 @@ Endpoints:
   GET  /getCandles?symbol=XAUUSD&timeframe=M5&count=100
   GET  /getAnalysis?symbol=XAUUSD&timeframe=M5
   GET  /getUpcomingNews?hours=72&impact=High&currency=USD
+  GET  /newsAlerts/status
+  POST /newsAlerts/start
+  POST /newsAlerts/stop
   GET  /suggestionWatch/status
   POST /suggestionWatch/stop
   GET  /telegramAlerts/status
@@ -65,7 +68,7 @@ from flask import Flask, jsonify, request
 # Config
 # ---------------------------------------------------------------------------
 API_KEY = "alphafx"
-API_VERSION = "1.7.8"
+API_VERSION = "1.7.9"
 MT5_PATH = os.environ.get("MT5_TERMINAL_PATH", "")
 HOST = "0.0.0.0"
 PORT = 8080
@@ -90,6 +93,12 @@ NEWS_CALENDAR_URL = os.environ.get(
     "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
 )
 NEWS_CACHE_TTL = int(os.environ.get("NEWS_CACHE_TTL", "300"))
+NEWS_ALERT_STATE_FILE = os.environ.get(
+    "NEWS_ALERT_STATE_FILE",
+    os.path.join(SCRIPT_DIR, "news_alert_state.json"),
+)
+NEWS_ALERT_POLL_MS = int(os.environ.get("NEWS_ALERT_POLL_MS", "30000"))
+NEWS_ALERT_MINUTES_BEFORE = int(os.environ.get("NEWS_ALERT_MINUTES_BEFORE", "5"))
 
 TIMEFRAMES = {
     "M1": mt5.TIMEFRAME_M1,
@@ -2140,8 +2149,11 @@ def build_upcoming_news(
             continue
 
         minutes_until = int((dt - now).total_seconds() // 60)
+        title = str(item.get("title", "")).strip()
+        event_id = f"{currency}|{dt.isoformat()}|{title}"
         events.append({
-            "title": str(item.get("title", "")).strip(),
+            "event_id": event_id,
+            "title": title,
             "currency": currency,
             "country": currency,
             "impact": str(item.get("impact", impact)).strip(),
@@ -2164,6 +2176,228 @@ def build_upcoming_news(
     }
 
 
+def _news_event_key(event: dict[str, Any]) -> str:
+    return str(event.get("event_id") or f"{event.get('currency')}|{event.get('time')}|{event.get('title')}")
+
+
+def format_news_alert_message(event: dict[str, Any], minutes_before: int) -> str:
+    cur = _html_escape(str(event.get("currency", "?")))
+    title = _html_escape(str(event.get("title", "?")))
+    when = _html_escape(str(event.get("time", "?")).replace("T", " ").replace("+00:00", " UTC"))
+    forecast = _html_escape(str(event.get("forecast", "—")))
+    previous = _html_escape(str(event.get("previous", "—")))
+    return (
+        f"<b>📕 News in {minutes_before} min</b>\n\n"
+        f"<b>{cur}</b> · {title}\n"
+        f"<b>Time:</b> {when}\n"
+        f"<b>Forecast:</b> {forecast} · <b>Previous:</b> {previous}\n"
+        f"<b>Impact:</b> High (red folder)"
+    )
+
+
+@dataclass
+class NewsAlertState:
+    active: bool = False
+    currency_filter: str = "USD"
+    hours_ahead: int = 72
+    minutes_before: int = NEWS_ALERT_MINUTES_BEFORE
+    notified_events: list[str] = field(default_factory=list)
+    alerts_sent: int = 0
+    started_at: str = ""
+    stopped_at: str = ""
+    last_check: str = ""
+    last_alert_at: str = ""
+    last_error: str = ""
+
+
+class NewsAlertManager:
+    """Telegram alert 5 minutes before high-impact calendar events."""
+
+    def __init__(self, poll_ms: int = NEWS_ALERT_POLL_MS):
+        self._state = NewsAlertState()
+        self._lock = threading.Lock()
+        self._poll_ms = poll_ms
+        self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
+        self._load_state()
+
+    def _load_state(self) -> None:
+        if not os.path.isfile(NEWS_ALERT_STATE_FILE):
+            return
+        try:
+            with open(NEWS_ALERT_STATE_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+            fields = {f.name for f in NewsAlertState.__dataclass_fields__.values()}
+            self._state = NewsAlertState(**{k: v for k, v in data.items() if k in fields})
+            if self._state.active:
+                print("[NewsAlerts] restored active monitoring from state file")
+                self.start(resume=True)
+        except Exception as exc:
+            print(f"[NewsAlerts] state load failed: {exc}")
+
+    def _save_state(self) -> None:
+        try:
+            with self._lock:
+                payload = asdict(self._state)
+                payload["version"] = 1
+                payload["saved_at"] = datetime.utcnow().isoformat() + "Z"
+            tmp = NEWS_ALERT_STATE_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+            os.replace(tmp, NEWS_ALERT_STATE_FILE)
+        except Exception as exc:
+            print(f"[NewsAlerts] state save failed: {exc}")
+
+    def _currencies_for_filter(self) -> list[str] | None:
+        filt = (self._state.currency_filter or "USD").upper()
+        if filt == "ALL":
+            return None
+        return [filt]
+
+    def status(self) -> dict[str, Any]:
+        with self._lock:
+            st = asdict(self._state)
+        return {
+            "ok": True,
+            "active": st["active"],
+            "notifications": "on" if st["active"] else "off",
+            "currency_filter": st["currency_filter"],
+            "hours_ahead": st["hours_ahead"],
+            "minutes_before": st["minutes_before"],
+            "alerts_sent": st["alerts_sent"],
+            "notified_events_count": len(st.get("notified_events") or []),
+            "started_at": st["started_at"],
+            "stopped_at": st["stopped_at"],
+            "last_check": st["last_check"],
+            "last_alert_at": st["last_alert_at"],
+            "last_error": st["last_error"],
+            "telegram_configured": bool(TELEGRAM_BOT_TOKEN.strip()),
+            "token_masked": mask_telegram_token(TELEGRAM_BOT_TOKEN),
+            "channel": TELEGRAM_CHAT_ID,
+            "chat_id": TELEGRAM_CHAT_ID,
+            "state_file": NEWS_ALERT_STATE_FILE,
+        }
+
+    def start(
+        self,
+        currency_filter: str = "USD",
+        hours_ahead: int = 72,
+        resume: bool = False,
+    ) -> dict[str, Any]:
+        if not TELEGRAM_BOT_TOKEN.strip():
+            return {"ok": False, "error": "TELEGRAM_BOT_TOKEN not set on server"}
+
+        filt = (currency_filter or "USD").strip().upper()
+        if filt not in ("USD", "ALL"):
+            filt = "USD"
+
+        if self._state.active and not resume:
+            self._state.currency_filter = filt
+            self._state.hours_ahead = min(168, max(1, int(hours_ahead)))
+            self._state.last_error = ""
+            self._save_state()
+            return {
+                "ok": True,
+                "message": "News alert settings updated",
+                "notifications": "on",
+                "currency_filter": self._state.currency_filter,
+                "minutes_before": self._state.minutes_before,
+            }
+
+        self._state.currency_filter = filt
+        self._state.hours_ahead = min(168, max(1, int(hours_ahead)))
+        self._state.minutes_before = NEWS_ALERT_MINUTES_BEFORE
+        self._state.active = True
+        self._state.started_at = datetime.utcnow().isoformat() + "Z"
+        self._state.stopped_at = ""
+        self._state.last_error = ""
+        self._save_state()
+        self._ensure_thread()
+
+        return {
+            "ok": True,
+            "message": f"News alerts started — Telegram {self._state.minutes_before}m before",
+            "notifications": "on",
+            "currency_filter": self._state.currency_filter,
+            "hours_ahead": self._state.hours_ahead,
+            "minutes_before": self._state.minutes_before,
+            "channel": TELEGRAM_CHAT_ID,
+        }
+
+    def stop(self) -> dict[str, Any]:
+        self._state.active = False
+        self._state.stopped_at = datetime.utcnow().isoformat() + "Z"
+        self._save_state()
+        return {
+            "ok": True,
+            "message": "News alerts stopped",
+            "notifications": "off",
+        }
+
+    def _ensure_thread(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._loop, daemon=True, name="news-alerts")
+        self._thread.start()
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            if self._state.active:
+                self._tick()
+            time.sleep(self._poll_ms / 1000.0)
+
+    def _already_notified(self, key: str) -> bool:
+        return key in self._state.notified_events
+
+    def _mark_notified(self, key: str) -> None:
+        if key not in self._state.notified_events:
+            self._state.notified_events.append(key)
+        if len(self._state.notified_events) > 500:
+            self._state.notified_events = self._state.notified_events[-500:]
+
+    def _tick(self) -> None:
+        self._state.last_check = datetime.utcnow().isoformat() + "Z"
+        try:
+            payload = build_upcoming_news(
+                hours_ahead=self._state.hours_ahead,
+                impact="High",
+                currencies=self._currencies_for_filter(),
+            )
+        except Exception as exc:
+            self._state.last_error = str(exc)
+            self._save_state()
+            return
+
+        target = self._state.minutes_before
+        window_lo = max(1, target - 1)
+        window_hi = target + 1
+
+        for event in payload.get("events", []):
+            key = _news_event_key(event)
+            if self._already_notified(key):
+                continue
+            minutes_until = int(event.get("minutes_until", 9999))
+            if window_lo <= minutes_until <= window_hi:
+                tg = send_telegram_message(
+                    format_news_alert_message(event, self._state.minutes_before)
+                )
+                if tg.get("ok"):
+                    self._mark_notified(key)
+                    self._state.alerts_sent += 1
+                    self._state.last_alert_at = datetime.utcnow().isoformat() + "Z"
+                    self._state.last_error = ""
+                    print(f"[NewsAlerts] sent {event.get('currency')} {event.get('title')} ({minutes_until}m)")
+                else:
+                    self._state.last_error = tg.get("error", "telegram send failed")
+                    print(f"[NewsAlerts] send failed: {self._state.last_error}")
+
+        self._save_state()
+
+
+news_alerts = NewsAlertManager()
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -2181,6 +2415,7 @@ def health():
         "trail_jobs": len(trail_mgr.status()),
         "suggestion_watch_jobs": len(suggestion_watch.status()),
         "telegram_alerts_active": telegram_alerts.status().get("active", False),
+        "news_alerts_active": news_alerts.status().get("active", False),
     })
 
 
@@ -2221,6 +2456,33 @@ def get_upcoming_news():
             "source": "forex_factory",
         }), 502
     return jsonify(payload)
+
+
+@app.route("/newsAlerts/status", methods=["GET"])
+@require_api_key
+def news_alerts_status():
+    return jsonify(news_alerts.status())
+
+
+@app.route("/newsAlerts/start", methods=["POST"])
+@require_api_key
+def news_alerts_start():
+    """
+    Start Telegram alerts N minutes before high-impact news.
+    Body: { "currency_filter": "USD" | "ALL", "hours_ahead": 72 }
+    """
+    data = json_body()
+    currency_filter = str(data.get("currency_filter", "USD")).strip().upper()
+    hours_ahead = int(data.get("hours_ahead", 72))
+    result = news_alerts.start(currency_filter=currency_filter, hours_ahead=hours_ahead)
+    return jsonify(result), (200 if result.get("ok") else 400)
+
+
+@app.route("/newsAlerts/stop", methods=["POST"])
+@require_api_key
+def news_alerts_stop():
+    result = news_alerts.stop()
+    return jsonify(result)
 
 
 @app.route("/getAccountHealth", methods=["GET"])
@@ -3851,4 +4113,5 @@ if __name__ == "__main__":
     basket_tp_mgr.start()
     suggestion_watch.start()
     telegram_alerts._ensure_thread()
+    news_alerts._ensure_thread()
     app.run(host=HOST, port=PORT, threaded=True)
