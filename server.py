@@ -48,7 +48,7 @@ from flask import Flask, jsonify, request
 # Config
 # ---------------------------------------------------------------------------
 API_KEY = "alphafx"
-API_VERSION = "1.5.1"
+API_VERSION = "1.5.2"
 MT5_PATH = os.environ.get("MT5_TERMINAL_PATH", "")
 HOST = "0.0.0.0"
 PORT = 8080
@@ -1959,6 +1959,7 @@ def build_trade_suggestion(sym: str, chart_tf: str, count: int = 200) -> dict[st
     pt = info.point
     min_dist = max(1, info.trade_stops_level) * pt
     buffer = max(atr * 0.35, min_dist * 2)
+    sl_pad = max(atr * 0.75, buffer, min_dist * 3)
 
     overall = analysis["overall_trend"]
     rsi_obs = list(analysis.get("rsi_order_blocks") or [])
@@ -1980,6 +1981,67 @@ def build_trade_suggestion(sym: str, chart_tf: str, count: int = 200) -> dict[st
             return max(below) if below else None
         above = [p for p in prices if p > entry + buffer]
         return min(above) if above else None
+
+    def prices_for_buy_ob(ob: dict) -> tuple[float, float, float]:
+        entry = float(ob["low"])
+        sl = float(ob["low"]) - sl_pad
+        tp = entry + atr * 2.0
+        swing_tp = nearest_swing_target(analysis.get("swing_highs") or [], entry, "buy")
+        if swing_tp and swing_tp > entry + sl_pad:
+            tp = swing_tp
+        return entry, sl, max(tp, entry + atr * 1.5)
+
+    def prices_for_sell_ob(ob: dict) -> tuple[float, float, float]:
+        entry = float(ob["high"])
+        sl = float(ob["high"]) + sl_pad
+        tp = entry - atr * 2.0
+        swing_tp = nearest_swing_target(analysis.get("swing_lows") or [], entry, "sell")
+        if swing_tp and swing_tp < entry - sl_pad:
+            tp = swing_tp
+        return entry, sl, min(tp, entry - atr * 1.5)
+
+    def setup_issues(side: str, entry: float, sl: float, tp: float, ob: dict) -> list[str]:
+        issues: list[str] = []
+        risk = abs(entry - sl)
+        reward = abs(tp - entry)
+        if risk < atr * 0.5:
+            issues.append("SL too tight for current ATR")
+        if side == "BUY":
+            if tp <= entry + min_dist:
+                issues.append("TP must be above entry")
+            if entry >= bid - min_dist and ob.get("status") != "AT_ZONE":
+                issues.append("entry not below market for buy limit")
+        else:
+            if tp >= entry - min_dist:
+                issues.append("TP must be below entry")
+            if entry <= ask + min_dist and ob.get("status") != "AT_ZONE":
+                issues.append("entry not above market for sell limit")
+        rr = reward / risk if risk else 0
+        if rr < 1.0:
+            issues.append(f"R:R too low ({rr:.1f})")
+        if rr > 4.0:
+            issues.append(f"R:R unrealistic ({rr:.1f})")
+        dist = float(ob.get("distance_atr") or 0)
+        if dist > 2.5 and ob.get("status") not in ("FRESH", "AT_ZONE"):
+            issues.append(f"zone {dist}x ATR away — weak retest odds")
+        return issues
+
+    def try_setup(
+        order_type: str,
+        side: str,
+        entry: float,
+        sl: float,
+        tp: float,
+        reason: str,
+        confidence: str,
+        ob: dict,
+    ) -> bool:
+        nonlocal setup
+        bad = setup_issues(side, entry, sl, tp, ob)
+        if bad:
+            return False
+        setup = make_setup(order_type, side, entry, sl, tp, reason, confidence, ob)
+        return True
 
     def make_setup(
         order_type: str,
@@ -2019,17 +2081,12 @@ def build_trade_suggestion(sym: str, chart_tf: str, count: int = 200) -> dict[st
         bears_above = sorted([ob for ob in bears if ob["high"] > bid], key=lambda o: o["high"])
         ob = bears_above[0] if bears_above else (bears[0] if bears else None)
         if ob:
-            entry = float(ob["high"])
-            sl = entry + buffer
-            tp = entry - atr * 2.0
-            swing_tp = nearest_swing_target(analysis.get("swing_lows") or [], entry, "sell")
-            if swing_tp and swing_tp < entry - buffer:
-                tp = swing_tp
+            entry, sl, tp = prices_for_sell_ob(ob)
             order_type = "sell_limit" if entry > ask + min_dist else "sell_stop"
             if order_type == "sell_stop" and entry <= ask:
                 entry = ask + min_dist
             conf = ob.get("intensity_tier", "MED") if ob.get("rsi_ob") else "MED"
-            setup = make_setup(
+            try_setup(
                 order_type, "SELL", entry, sl, tp,
                 f"{overall} — sell retest bearish OB ({ob.get('volume_k', '?')}) · {ob.get('status', 'FRESH')}",
                 conf, ob,
@@ -2041,17 +2098,12 @@ def build_trade_suggestion(sym: str, chart_tf: str, count: int = 200) -> dict[st
         bulls_below = sorted([ob for ob in bulls if ob["low"] < ask], key=lambda o: -o["low"])
         ob = bulls_below[0] if bulls_below else (bulls[0] if bulls else None)
         if ob:
-            entry = float(ob["low"])
-            sl = entry - buffer
-            tp = entry + atr * 2.0
-            swing_tp = nearest_swing_target(analysis.get("swing_highs") or [], entry, "buy")
-            if swing_tp and swing_tp > entry + buffer:
-                tp = swing_tp
+            entry, sl, tp = prices_for_buy_ob(ob)
             order_type = "buy_limit" if entry < bid - min_dist else "buy_stop"
             if order_type == "buy_stop" and entry <= ask:
                 entry = ask + min_dist
             conf = ob.get("intensity_tier", "MED") if ob.get("rsi_ob") else "MED"
-            setup = make_setup(
+            try_setup(
                 order_type, "BUY", entry, sl, tp,
                 f"{overall} — buy retest bullish OB ({ob.get('volume_k', '?')}) · {ob.get('status', 'FRESH')}",
                 conf, ob,
@@ -2076,43 +2128,33 @@ def build_trade_suggestion(sym: str, chart_tf: str, count: int = 200) -> dict[st
             ob = blocks[0]
         if ob:
             if ob["type"] == "BEARISH_OB":
-                entry = float(ob["high"])
-                sl = entry + buffer
-                tp = entry - atr * 2.0
-                swing_tp = nearest_swing_target(analysis.get("swing_lows") or [], entry, "sell")
-                if swing_tp and swing_tp < entry - buffer:
-                    tp = swing_tp
+                entry, sl, tp = prices_for_sell_ob(ob)
                 if ob.get("status") == "AT_ZONE":
                     order_type = "sell"
                     entry = bid
-                    sl = float(ob["high"]) + buffer
+                    sl = float(ob["high"]) + sl_pad
                 else:
                     order_type = "sell_limit" if entry > ask + min_dist else "sell_stop"
                     if order_type == "sell_stop" and entry <= ask:
                         entry = ask + min_dist
-                setup = make_setup(
+                try_setup(
                     order_type, "SELL", entry, sl, tp,
-                    f"NEUTRAL / M5 {chart_trend} — bearish OB ({ob.get('volume_k', '?')}) · {ob.get('status', 'FRESH')}",
+                    f"NEUTRAL / {chart_tf} {chart_trend} — bearish OB ({ob.get('volume_k', '?')}) · {ob.get('status', 'FRESH')}",
                     ob.get("intensity_tier", "MED"), ob,
                 )
             else:
-                entry = float(ob["low"])
-                sl = entry - buffer
-                tp = entry + atr * 2.0
-                swing_tp = nearest_swing_target(analysis.get("swing_highs") or [], entry, "buy")
-                if swing_tp and swing_tp > entry + buffer:
-                    tp = swing_tp
+                entry, sl, tp = prices_for_buy_ob(ob)
                 if ob.get("status") == "AT_ZONE":
                     order_type = "buy"
                     entry = ask
-                    sl = float(ob["low"]) - buffer
+                    sl = float(ob["low"]) - sl_pad
                 else:
                     order_type = "buy_limit" if entry < bid - min_dist else "buy_stop"
                     if order_type == "buy_stop" and entry <= ask:
                         entry = ask + min_dist
-                setup = make_setup(
+                try_setup(
                     order_type, "BUY", entry, sl, tp,
-                    f"NEUTRAL / M5 {chart_trend} — bullish OB ({ob.get('volume_k', '?')}) · {ob.get('status', 'FRESH')}",
+                    f"NEUTRAL / {chart_tf} {chart_trend} — bullish OB ({ob.get('volume_k', '?')}) · {ob.get('status', 'FRESH')}",
                     ob.get("intensity_tier", "MED"), ob,
                 )
 
@@ -2120,71 +2162,21 @@ def build_trade_suggestion(sym: str, chart_tf: str, count: int = 200) -> dict[st
     if setup is None and rsi_obs:
         ob = next((o for o in rsi_obs if tradeable(o)), None)
         if ob and ob["type"] == "BULLISH_OB":
-            entry = float(ob["low"])
-            sl = entry - buffer
-            tp = entry + atr * 2.0
+            entry, sl, tp = prices_for_buy_ob(ob)
             order_type = "buy_limit" if entry < bid - min_dist else "buy_stop"
-            setup = make_setup(
+            try_setup(
                 order_type, "BUY", entry, sl, tp,
                 f"RSI bullish OB ({ob.get('volume_k', '?')} · RSI {ob.get('rsi')}) · {ob.get('status', 'FRESH')}",
                 ob.get("intensity_tier", "LOW"), ob,
             )
         elif ob and ob["type"] == "BEARISH_OB":
-            entry = float(ob["high"])
-            sl = entry + buffer
-            tp = entry - atr * 2.0
+            entry, sl, tp = prices_for_sell_ob(ob)
             order_type = "sell_limit" if entry > ask + min_dist else "sell_stop"
-            setup = make_setup(
+            try_setup(
                 order_type, "SELL", entry, sl, tp,
                 f"RSI bearish OB ({ob.get('volume_k', '?')} · RSI {ob.get('rsi')}) · {ob.get('status', 'FRESH')}",
                 ob.get("intensity_tier", "LOW"), ob,
             )
-
-    # --- Counter-trend: strong trend but only valid OB on opposite side ---
-    if setup is None and overall in ("STRONG_DOWN", "STRONG_UP") and blocks:
-        if overall == "STRONG_DOWN":
-            bulls = sorted(
-                [ob for ob in blocks if ob["type"] == "BULLISH_OB"],
-                key=lambda o: float(o["low"]),
-                reverse=True,
-            )
-            ob = next((o for o in bulls if float(o["low"]) < ask), bulls[0] if bulls else None)
-            if ob:
-                entry = float(ob["low"])
-                sl = entry - buffer
-                tp = entry + atr * 2.0
-                swing_tp = nearest_swing_target(analysis.get("swing_highs") or [], entry, "buy")
-                if swing_tp and swing_tp > entry + buffer:
-                    tp = swing_tp
-                order_type = "buy_limit" if entry < bid - min_dist else "buy_stop"
-                if order_type == "buy_stop" and entry <= ask:
-                    entry = ask + min_dist
-                setup = make_setup(
-                    order_type, "BUY", entry, sl, tp,
-                    f"Counter-trend BUY — {overall}, bullish OB below ({ob.get('volume_k', '?')}) · {ob.get('status', 'FRESH')}",
-                    "LOW", ob,
-                )
-        elif overall == "STRONG_UP":
-            bears = sorted(
-                [ob for ob in blocks if ob["type"] == "BEARISH_OB"],
-                key=lambda o: float(o["high"]),
-            )
-            ob = next((o for o in bears if float(o["high"]) > bid), bears[0] if bears else None)
-            if ob:
-                entry = float(ob["high"])
-                sl = entry + buffer
-                tp = entry - atr * 2.0
-                swing_tp = nearest_swing_target(analysis.get("swing_lows") or [], entry, "sell")
-                if swing_tp and swing_tp < entry - buffer:
-                    tp = swing_tp
-                order_type = "sell_limit" if entry > ask + min_dist else "sell_stop"
-                if order_type == "sell_stop" and entry <= ask:
-                    entry = ask + min_dist
-                setup = make_setup(
-                    order_type, "SELL", entry, sl, tp,
-                    f"Counter-trend SELL — {overall}, bearish OB above ({ob.get('volume_k', '?')}) · {ob.get('status', 'FRESH')}",
-                    "LOW", ob,
-                )
 
     if setup is None:
         valid_n = len(blocks)
@@ -2193,9 +2185,15 @@ def build_trade_suggestion(sym: str, chart_tf: str, count: int = 200) -> dict[st
         if valid_n == 0:
             message = "No valid OB — all zones broken, mitigated, or stale"
         elif overall in ("STRONG_DOWN", "DOWN") and bears_n == 0:
-            message = f"{overall} — no valid bearish OB for sell ({bulls_n} bullish zone(s) only)"
+            message = (
+                f"{overall} — wait for bearish OB retest above price "
+                f"(don't buy dips; {bulls_n} bullish zone(s) below ignored)"
+            )
         elif overall in ("STRONG_UP", "UP") and bulls_n == 0:
-            message = f"{overall} — no valid bullish OB for buy ({bears_n} bearish zone(s) only)"
+            message = (
+                f"{overall} — wait for bullish OB retest below price "
+                f"(don't fade strength; {bears_n} bearish zone(s) above ignored)"
+            )
         else:
             message = f"No setup — {valid_n} valid OB(s) but none match current trend filter"
         return {
