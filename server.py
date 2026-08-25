@@ -15,6 +15,9 @@ Endpoints:
   GET  /getTradeSuggestion?symbol=XAUUSD&timeframe=M5
   GET  /suggestionWatch/status
   POST /suggestionWatch/stop
+  GET  /telegramAlerts/status
+  POST /telegramAlerts/start
+  POST /telegramAlerts/stop
   POST /placeOrder
   POST /placeTrades
   GET  /getPositions
@@ -35,6 +38,9 @@ Endpoints:
   POST /basketTp/apply      — one-shot TP recalc
   GET  /suggestionWatch/status
   POST /suggestionWatch/stop
+  POST /telegramAlerts/start   — candle-close OB signals to Telegram
+  POST /telegramAlerts/stop
+  GET  /telegramAlerts/status
 """
 from __future__ import annotations
 
@@ -42,6 +48,8 @@ import json
 import os
 import threading
 import time
+import urllib.error
+import urllib.request
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
 from functools import wraps
@@ -54,7 +62,7 @@ from flask import Flask, jsonify, request
 # Config
 # ---------------------------------------------------------------------------
 API_KEY = "alphafx"
-API_VERSION = "1.6.0"
+API_VERSION = "1.7.1"
 MT5_PATH = os.environ.get("MT5_TERMINAL_PATH", "")
 HOST = "0.0.0.0"
 PORT = 8080
@@ -66,6 +74,14 @@ SUGGESTION_WATCH_STATE_FILE = os.environ.get(
     os.path.join(SCRIPT_DIR, "suggestion_watch_state.json"),
 )
 SUGGESTION_WATCH_POLL_MS = int(os.environ.get("SUGGESTION_WATCH_POLL_MS", "2000"))
+TELEGRAM_BOT_TOKEN = "8841267528:AAG86G9391dZ0mLWe02214O_Pu7sHBEz-iQ"
+TELEGRAM_CHAT_ID = "@partneralphafx"
+TELEGRAM_ALERT_STATE_FILE = os.environ.get(
+    "TELEGRAM_ALERT_STATE_FILE",
+    os.path.join(SCRIPT_DIR, "telegram_alert_state.json"),
+)
+TELEGRAM_ALERT_POLL_MS = int(os.environ.get("TELEGRAM_ALERT_POLL_MS", "5000"))
+TELEGRAM_ALERT_TIMEFRAMES = ["M1", "M5", "M15", "M30", "H1"]
 
 TIMEFRAMES = {
     "M1": mt5.TIMEFRAME_M1,
@@ -1658,6 +1674,337 @@ suggestion_watch = SuggestionWatchManager()
 
 
 # ---------------------------------------------------------------------------
+# Telegram candle-close alerts
+# ---------------------------------------------------------------------------
+def _html_escape(text: str) -> str:
+    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def mask_telegram_token(token: str) -> str:
+    t = token.strip()
+    if not t:
+        return "—"
+    if len(t) <= 12:
+        return t[:4] + "****"
+    return f"{t[:8]}****{t[-4:]}"
+
+
+def send_telegram_message(text: str) -> dict[str, Any]:
+    """Send HTML message to configured Telegram channel."""
+    token = TELEGRAM_BOT_TOKEN.strip()
+    if not token:
+        return {"ok": False, "error": "TELEGRAM_BOT_TOKEN not set"}
+    chat_id = TELEGRAM_CHAT_ID.strip() or "@partneralphafx"
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = json.dumps({
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+        if body.get("ok"):
+            return {"ok": True, "message_id": (body.get("result") or {}).get("message_id")}
+        return {"ok": False, "error": body.get("description", "telegram api error")}
+    except urllib.error.HTTPError as exc:
+        try:
+            err_body = json.loads(exc.read().decode("utf-8"))
+            detail = err_body.get("description", str(exc))
+        except Exception:
+            detail = str(exc)
+        return {"ok": False, "error": detail}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def format_telegram_signal(result: dict[str, Any]) -> str:
+    ob = result.get("ob") or {}
+    sym = result.get("symbol", "?")
+    tf = result.get("chart_timeframe", "?")
+    side = str(result.get("side", "?"))
+    emoji = "🟢" if side == "BUY" else "🔴"
+    lines = [
+        f"<b>{emoji} AlphaFX Signal</b>",
+        "",
+        f"<b>Symbol:</b> {_html_escape(sym)}",
+        f"<b>Timeframe:</b> {_html_escape(tf)}",
+        f"<b>Trend:</b> {_html_escape(result.get('overall_trend', '?'))}",
+        "",
+        f"<b>{_html_escape(side)}</b> · {_html_escape(result.get('order_type', '?'))}",
+        f"<b>Entry:</b> {result.get('entry')}",
+        f"<b>SL:</b> {result.get('sl')}",
+        f"<b>TP:</b> {result.get('tp')}",
+        f"<b>R:R:</b> {result.get('rr')}:1",
+        f"<b>Confidence:</b> {_html_escape(result.get('confidence', '?'))}",
+        "",
+        _html_escape(result.get("reason", "")),
+    ]
+    if ob:
+        lines.append(
+            f"OB: {_html_escape(ob.get('type', '?'))} · "
+            f"{_html_escape(ob.get('status', '?'))} · "
+            f"{_html_escape(ob.get('volume_k', '?'))}"
+        )
+    bid = result.get("bid")
+    if bid is not None:
+        lines.append(f"Price: {bid}")
+    return "\n".join(lines)
+
+
+@dataclass
+class TelegramAlertState:
+    active: bool = False
+    symbol: str = "XAUUSD"
+    bar_count: int = 200
+    timeframes: list[str] = field(default_factory=lambda: list(TELEGRAM_ALERT_TIMEFRAMES))
+    last_closed: dict[str, int] = field(default_factory=dict)
+    notified_blocks: list[str] = field(default_factory=list)
+    started_at: str = ""
+    stopped_at: str = ""
+    signals_sent: int = 0
+    last_check: str = ""
+    last_signal_at: str = ""
+    last_error: str = ""
+
+
+class TelegramAlertManager:
+    """On each M1/M5/M15/M30/H1 candle close, send trade suggestion to Telegram."""
+
+    def __init__(self, poll_ms: int = TELEGRAM_ALERT_POLL_MS):
+        self._state = TelegramAlertState()
+        self._resolved_symbol = ""
+        self._lock = threading.Lock()
+        self._poll_ms = poll_ms
+        self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
+        self._load_state()
+
+    def _load_state(self) -> None:
+        if not os.path.isfile(TELEGRAM_ALERT_STATE_FILE):
+            return
+        try:
+            with open(TELEGRAM_ALERT_STATE_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+            fields = {f.name for f in TelegramAlertState.__dataclass_fields__.values()}
+            self._state = TelegramAlertState(**{k: v for k, v in data.items() if k in fields})
+            # migrate old per-TF dedup keys
+            legacy = data.get("last_sent") or {}
+            if isinstance(legacy, dict):
+                for key in legacy.values():
+                    if key and key not in self._state.notified_blocks:
+                        self._state.notified_blocks.append(str(key))
+            self._resolved_symbol = str(data.get("resolved_symbol") or "")
+            if self._state.active:
+                print("[TelegramAlerts] restored active monitoring from state file")
+                self.start(resume=True)
+        except Exception as exc:
+            print(f"[TelegramAlerts] state load failed: {exc}")
+
+    def _save_state(self) -> None:
+        try:
+            with self._lock:
+                payload = asdict(self._state)
+                payload["resolved_symbol"] = self._resolved_symbol
+                payload["version"] = 1
+                payload["saved_at"] = datetime.utcnow().isoformat() + "Z"
+            tmp = TELEGRAM_ALERT_STATE_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+            os.replace(tmp, TELEGRAM_ALERT_STATE_FILE)
+        except Exception as exc:
+            print(f"[TelegramAlerts] state save failed: {exc}")
+
+    def status(self) -> dict[str, Any]:
+        with self._lock:
+            st = asdict(self._state)
+        return {
+            "ok": True,
+            "active": st["active"],
+            "notifications": "on" if st["active"] else "off",
+            "symbol": st["symbol"],
+            "resolved_symbol": self._resolved_symbol,
+            "bar_count": st["bar_count"],
+            "timeframes": st["timeframes"],
+            "signals_sent": st["signals_sent"],
+            "notified_blocks_count": len(st.get("notified_blocks") or []),
+            "started_at": st["started_at"],
+            "stopped_at": st["stopped_at"],
+            "last_check": st["last_check"],
+            "last_signal_at": st["last_signal_at"],
+            "last_error": st["last_error"],
+            "telegram_configured": bool(TELEGRAM_BOT_TOKEN.strip()),
+            "token_masked": mask_telegram_token(TELEGRAM_BOT_TOKEN),
+            "channel": TELEGRAM_CHAT_ID,
+            "chat_id": TELEGRAM_CHAT_ID,
+            "state_file": TELEGRAM_ALERT_STATE_FILE,
+        }
+
+    def start(self, symbol: str = "", bar_count: int = 0, resume: bool = False) -> dict[str, Any]:
+        if not TELEGRAM_BOT_TOKEN.strip():
+            return {"ok": False, "error": "TELEGRAM_BOT_TOKEN not set on server"}
+
+        if self._state.active and not resume:
+            return {
+                "ok": True,
+                "message": "Already monitoring",
+                "symbol": self._state.symbol,
+                "resolved_symbol": self._resolved_symbol,
+                "timeframes": self._state.timeframes,
+            }
+
+        ok, msg = ensure_mt5(MT5_PATH or None)
+        if not ok:
+            return {"ok": False, "error": "mt5 not connected", "detail": msg}
+
+        if symbol:
+            self._state.symbol = symbol.strip()
+        if bar_count > 0:
+            self._state.bar_count = max(50, min(int(bar_count), 5000))
+
+        info, sym = resolve_symbol(self._state.symbol)
+        if info is None:
+            return {"ok": False, "error": f"symbol not found: {self._state.symbol}"}
+        self._resolved_symbol = sym
+
+        self._sync_bar_times(sym, initialize=True)
+        self._state.active = True
+        self._state.started_at = datetime.utcnow().isoformat() + "Z"
+        self._state.stopped_at = ""
+        self._state.last_error = ""
+        self._save_state()
+        self._ensure_thread()
+
+        return {
+            "ok": True,
+            "message": "Telegram monitoring started",
+            "symbol": self._state.symbol,
+            "resolved_symbol": sym,
+            "timeframes": self._state.timeframes,
+            "notifications": "on",
+            "token_masked": mask_telegram_token(TELEGRAM_BOT_TOKEN),
+            "channel": TELEGRAM_CHAT_ID,
+        }
+
+    def stop(self) -> dict[str, Any]:
+        self._state.active = False
+        self._state.stopped_at = datetime.utcnow().isoformat() + "Z"
+        self._save_state()
+        return {
+            "ok": True,
+            "message": "Telegram monitoring stopped",
+            "notifications": "off",
+        }
+
+    def _ensure_thread(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._loop, daemon=True, name="telegram-alerts")
+        self._thread.start()
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            if self._state.active:
+                self._tick()
+            time.sleep(self._poll_ms / 1000.0)
+
+    def _sync_bar_times(self, sym: str, initialize: bool = False) -> None:
+        for tf in self._state.timeframes:
+            mt5_tf = TIMEFRAMES.get(tf)
+            if mt5_tf is None:
+                continue
+            rates = mt5.copy_rates_from_pos(sym, mt5_tf, 0, 3)
+            if rates is None or len(rates) < 2:
+                continue
+            closed_time = int(rates[-2]["time"])
+            prev = self._state.last_closed.get(tf)
+            if initialize or prev is None:
+                self._state.last_closed[tf] = closed_time
+            elif closed_time != prev:
+                self._state.last_closed[tf] = closed_time
+                self._on_candle_close(sym, tf)
+
+    def _ob_notify_key(self, sym: str, ob: dict) -> str:
+        """One key per OB zone — shared across all timeframes so we never repeat."""
+        return "|".join([
+            sym,
+            str(ob.get("type", "")),
+            str(ob.get("time", "")),
+            str(ob.get("high", "")),
+            str(ob.get("low", "")),
+        ])
+
+    def _already_notified(self, key: str) -> bool:
+        return key in self._state.notified_blocks
+
+    def _mark_notified(self, key: str) -> None:
+        if key not in self._state.notified_blocks:
+            self._state.notified_blocks.append(key)
+        if len(self._state.notified_blocks) > 500:
+            self._state.notified_blocks = self._state.notified_blocks[-500:]
+
+    def _on_candle_close(self, sym: str, tf: str) -> None:
+        result = build_trade_suggestion(sym, tf, self._state.bar_count)
+        if not result.get("ok"):
+            self._state.last_error = result.get("error", "analysis failed")
+            return
+        if not result.get("has_setup"):
+            return
+
+        ob = result.get("ob") or {}
+        if not ob:
+            return
+        if not ob.get("is_tradeable", True):
+            return
+        if ob.get("status") in ("BROKEN", "MITIGATED", "STALE"):
+            return
+
+        key = self._ob_notify_key(sym, ob)
+        if self._already_notified(key):
+            return
+
+        result["symbol"] = sym
+        result["chart_timeframe"] = tf
+        tg = send_telegram_message(format_telegram_signal(result))
+        if tg.get("ok"):
+            self._mark_notified(key)
+            self._state.signals_sent += 1
+            self._state.last_signal_at = datetime.utcnow().isoformat() + "Z"
+            self._state.last_error = ""
+            print(f"[TelegramAlerts] signal sent {sym} {tf} OB {ob.get('time')} {result.get('side')}")
+        else:
+            self._state.last_error = tg.get("error", "telegram send failed")
+            print(f"[TelegramAlerts] send failed: {self._state.last_error}")
+
+    def _tick(self) -> None:
+        self._state.last_check = datetime.utcnow().isoformat() + "Z"
+        sym = self._resolved_symbol
+        if not sym:
+            info, sym = resolve_symbol(self._state.symbol)
+            if info is None:
+                self._state.last_error = f"symbol not found: {self._state.symbol}"
+                self._save_state()
+                return
+            self._resolved_symbol = sym
+        try:
+            self._sync_bar_times(sym, initialize=False)
+        except Exception as exc:
+            self._state.last_error = str(exc)
+        self._save_state()
+
+
+telegram_alerts = TelegramAlertManager()
+
+
+# ---------------------------------------------------------------------------
 # Auth / helpers
 # ---------------------------------------------------------------------------
 def require_api_key(fn: Callable) -> Callable:
@@ -1701,6 +2048,7 @@ def health():
         "server": account.server if account else None,
         "trail_jobs": len(trail_mgr.status()),
         "suggestion_watch_jobs": len(suggestion_watch.status()),
+        "telegram_alerts_active": telegram_alerts.status().get("active", False),
     })
 
 
@@ -3071,6 +3419,35 @@ def suggestion_watch_stop():
     return jsonify({"ok": removed, "ticket": int(ticket)})
 
 
+@app.route("/telegramAlerts/status", methods=["GET"])
+@require_api_key
+def telegram_alerts_status():
+    return jsonify(telegram_alerts.status())
+
+
+@app.route("/telegramAlerts/start", methods=["POST"])
+@require_api_key
+@require_mt5
+def telegram_alerts_start():
+    """
+    Start candle-close monitoring → Telegram signals.
+    Body: { "symbol": "XAUUSD", "bar_count": 200 }
+    """
+    data = json_body()
+    symbol = str(data.get("symbol", "XAUUSD")).strip()
+    bar_count = int(data.get("bar_count", 200))
+    result = telegram_alerts.start(symbol=symbol, bar_count=bar_count)
+    return jsonify(result), (200 if result.get("ok") else 400)
+
+
+@app.route("/telegramAlerts/stop", methods=["POST"])
+@require_api_key
+def telegram_alerts_stop():
+    """Stop Telegram monitoring and send stop message to channel."""
+    result = telegram_alerts.stop()
+    return jsonify(result)
+
+
 if __name__ == "__main__":
     ok, msg = ensure_mt5(MT5_PATH or None)
     print(f"[MT5] {msg}")
@@ -3079,4 +3456,5 @@ if __name__ == "__main__":
     grid_guard.start()
     basket_tp_mgr.start()
     suggestion_watch.start()
+    telegram_alerts._ensure_thread()
     app.run(host=HOST, port=PORT, threaded=True)
