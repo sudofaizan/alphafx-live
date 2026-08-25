@@ -1682,6 +1682,101 @@ def enrich_order_block_intensity(bars: list[dict[str, Any]], blocks: list[dict[s
     return blocks
 
 
+def enrich_order_block_validity(
+    bars: list[dict[str, Any]],
+    blocks: list[dict[str, Any]],
+    current_price: float,
+    atr: float,
+    max_age_bars: int = 80,
+    max_distance_atr: float = 4.0,
+) -> list[dict[str, Any]]:
+    """
+    Classify each OB as tradeable or expired (SMC-style).
+
+    FRESH    — never retested; still valid
+    AT_ZONE  — price inside OB now
+    TESTED   — one retest, not broken
+    MITIGATED — 2+ retests (zone used up)
+    BROKEN   — close through OB (bull: close < low, bear: close > high)
+    STALE    — too many bars old, or too far without any retest
+    """
+    time_to_idx = {b["time"]: i for i, b in enumerate(bars)}
+    n = len(bars)
+    safe_atr = atr if atr > 0 else 1.0
+
+    for ob in blocks:
+        idx = time_to_idx.get(ob["time"])
+        if idx is None:
+            ob.update({
+                "status": "UNKNOWN",
+                "status_label": "Unknown",
+                "is_valid": False,
+                "is_tradeable": False,
+            })
+            continue
+
+        zone_low = float(ob["low"])
+        zone_high = float(ob["high"])
+        bars_since = n - 1 - idx
+        ob["bars_since"] = bars_since
+
+        broken = False
+        touches = 0
+        for j in range(idx + 1, n):
+            bar = bars[j]
+            close_p, high_p, low_p = bar["close"], bar["high"], bar["low"]
+            if ob["type"] == "BULLISH_OB" and close_p < zone_low:
+                broken = True
+                break
+            if ob["type"] == "BEARISH_OB" and close_p > zone_high:
+                broken = True
+                break
+            if high_p >= zone_low and low_p <= zone_high:
+                touches += 1
+
+        if current_price > zone_high:
+            dist = current_price - zone_high
+        elif current_price < zone_low:
+            dist = zone_low - current_price
+        else:
+            dist = 0.0
+
+        dist_atr = round(dist / safe_atr, 2)
+        ob["distance"] = round(dist, 5)
+        ob["distance_atr"] = dist_atr
+        ob["touch_count"] = touches
+        ob["broken"] = broken
+
+        if broken:
+            status, label = "BROKEN", "Expired — close through OB"
+            is_valid = is_tradeable = False
+        elif dist == 0:
+            status, label = "AT_ZONE", "Price at OB now — valid"
+            is_valid = is_tradeable = True
+        elif touches >= 2:
+            status, label = "MITIGATED", "Mitigated — tested 2+ times"
+            is_valid = is_tradeable = False
+        elif bars_since > max_age_bars:
+            status, label = "STALE", f"Expired — older than {max_age_bars} bars"
+            is_valid = is_tradeable = False
+        elif touches == 1:
+            status, label = "TESTED", "Tested once — still valid"
+            is_valid = is_tradeable = True
+        elif dist_atr > max_distance_atr:
+            status, label = "STALE", f"Stale — {dist_atr}x ATR away, never tested"
+            is_valid = is_tradeable = False
+        else:
+            status, label = "FRESH", "Fresh — untested OB"
+            is_valid = is_tradeable = True
+
+        ob["status"] = status
+        ob["status_label"] = label
+        ob["is_valid"] = is_valid
+        ob["is_tradeable"] = is_tradeable
+
+    return blocks
+
+
 def mark_rsi_order_blocks(bars: list[dict[str, Any]], blocks: list[dict[str, Any]], period: int = 14) -> list[dict[str, Any]]:
     """Flag OBs where RSI was oversold (bull) or overbought (bear) at formation."""
     closes = [b["close"] for b in bars]
@@ -1766,6 +1861,17 @@ def build_chart_analysis(sym: str, chart_tf: str, count: int = 200) -> dict[str,
     order_blocks = mark_rsi_order_blocks(bars, order_blocks)
     order_blocks = enrich_order_block_intensity(bars, order_blocks)
 
+    tick = mt5.symbol_info_tick(sym)
+    current_price = tick.bid if tick else closes[-1]
+    atr_val = (
+        sum(
+            max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1]))
+            for i in range(1, min(15, len(closes)))
+        ) / 14
+        if len(closes) > 14 else 5.0
+    )
+    order_blocks = enrich_order_block_validity(bars, order_blocks, current_price, atr_val)
+
     for ob in order_blocks:
         ob["time"] = datetime.utcfromtimestamp(ob["time"]).isoformat() + "Z"
 
@@ -1807,9 +1913,11 @@ def build_chart_analysis(sym: str, chart_tf: str, count: int = 200) -> dict[str,
         "ema50": ema50_pts[-80:],
         "order_blocks": order_blocks,
         "rsi_order_blocks": [ob for ob in order_blocks if ob.get("rsi_ob")],
+        "valid_order_blocks": [ob for ob in order_blocks if ob.get("is_tradeable")],
+        "valid_rsi_order_blocks": [ob for ob in order_blocks if ob.get("rsi_ob") and ob.get("is_tradeable")],
         "strongest_rsi_ob": next(
-            (ob for ob in order_blocks if ob.get("rsi_ob")),
-            None,
+            (ob for ob in order_blocks if ob.get("rsi_ob") and ob.get("is_tradeable")),
+            next((ob for ob in order_blocks if ob.get("rsi_ob")), None),
         ),
         "swing_highs": [
             {"time": datetime.utcfromtimestamp(s["time"]).isoformat() + "Z", "price": s["price"]}
@@ -1842,7 +1950,12 @@ def build_trade_suggestion(sym: str, chart_tf: str, count: int = 200) -> dict[st
     overall = analysis["overall_trend"]
     rsi_obs = list(analysis.get("rsi_order_blocks") or [])
     all_obs = list(analysis.get("order_blocks") or [])
-    blocks = sorted(rsi_obs or all_obs, key=lambda o: o.get("intensity", 0), reverse=True)
+    tradeable = lambda ob: ob.get("is_tradeable", True)
+    blocks = sorted(
+        [ob for ob in (rsi_obs or all_obs) if tradeable(ob)],
+        key=lambda o: o.get("intensity", 0),
+        reverse=True,
+    )
 
     def rr_ratio(entry: float, sl: float, tp: float) -> float:
         risk = abs(entry - sl)
@@ -1907,7 +2020,7 @@ def build_trade_suggestion(sym: str, chart_tf: str, count: int = 200) -> dict[st
             conf = ob.get("intensity_tier", "MED") if ob.get("rsi_ob") else "MED"
             setup = make_setup(
                 order_type, "SELL", entry, sl, tp,
-                f"{overall} — sell retest bearish OB ({ob.get('volume_k', '?')})",
+                f"{overall} — sell retest bearish OB ({ob.get('volume_k', '?')}) · {ob.get('status', 'FRESH')}",
                 conf, ob,
             )
 
@@ -1929,31 +2042,31 @@ def build_trade_suggestion(sym: str, chart_tf: str, count: int = 200) -> dict[st
             conf = ob.get("intensity_tier", "MED") if ob.get("rsi_ob") else "MED"
             setup = make_setup(
                 order_type, "BUY", entry, sl, tp,
-                f"{overall} — buy retest bullish OB ({ob.get('volume_k', '?')})",
+                f"{overall} — buy retest bullish OB ({ob.get('volume_k', '?')}) · {ob.get('status', 'FRESH')}",
                 conf, ob,
             )
 
-    # --- Neutral / counter-trend: best RSI OB ---
+    # --- Neutral / counter-trend: best tradeable RSI OB ---
     if setup is None and rsi_obs:
-        ob = rsi_obs[0]
-        if ob["type"] == "BULLISH_OB":
+        ob = next((o for o in rsi_obs if tradeable(o)), None)
+        if ob and ob["type"] == "BULLISH_OB":
             entry = float(ob["low"])
             sl = entry - buffer
             tp = entry + atr * 2.0
             order_type = "buy_limit" if entry < bid - min_dist else "buy_stop"
             setup = make_setup(
                 order_type, "BUY", entry, sl, tp,
-                f"RSI bullish OB ({ob.get('volume_k', '?')} · RSI {ob.get('rsi')})",
+                f"RSI bullish OB ({ob.get('volume_k', '?')} · RSI {ob.get('rsi')}) · {ob.get('status', 'FRESH')}",
                 ob.get("intensity_tier", "LOW"), ob,
             )
-        elif ob["type"] == "BEARISH_OB":
+        elif ob and ob["type"] == "BEARISH_OB":
             entry = float(ob["high"])
             sl = entry + buffer
             tp = entry - atr * 2.0
             order_type = "sell_limit" if entry > ask + min_dist else "sell_stop"
             setup = make_setup(
                 order_type, "SELL", entry, sl, tp,
-                f"RSI bearish OB ({ob.get('volume_k', '?')} · RSI {ob.get('rsi')})",
+                f"RSI bearish OB ({ob.get('volume_k', '?')} · RSI {ob.get('rsi')}) · {ob.get('status', 'FRESH')}",
                 ob.get("intensity_tier", "LOW"), ob,
             )
 
@@ -1965,7 +2078,7 @@ def build_trade_suggestion(sym: str, chart_tf: str, count: int = 200) -> dict[st
             "chart_timeframe": chart_tf,
             "overall_trend": overall,
             "price": bid,
-            "message": "No OB retest setup — wait for price at order block",
+            "message": "No valid OB setup — all zones broken, mitigated, or stale",
         }
 
     return {
