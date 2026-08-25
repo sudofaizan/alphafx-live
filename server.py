@@ -48,7 +48,7 @@ from flask import Flask, jsonify, request
 # Config
 # ---------------------------------------------------------------------------
 API_KEY = "alphafx"
-API_VERSION = "1.5.0"
+API_VERSION = "1.5.1"
 MT5_PATH = os.environ.get("MT5_TERMINAL_PATH", "")
 HOST = "0.0.0.0"
 PORT = 8080
@@ -2140,7 +2140,64 @@ def build_trade_suggestion(sym: str, chart_tf: str, count: int = 200) -> dict[st
                 ob.get("intensity_tier", "LOW"), ob,
             )
 
+    # --- Counter-trend: strong trend but only valid OB on opposite side ---
+    if setup is None and overall in ("STRONG_DOWN", "STRONG_UP") and blocks:
+        if overall == "STRONG_DOWN":
+            bulls = sorted(
+                [ob for ob in blocks if ob["type"] == "BULLISH_OB"],
+                key=lambda o: float(o["low"]),
+                reverse=True,
+            )
+            ob = next((o for o in bulls if float(o["low"]) < ask), bulls[0] if bulls else None)
+            if ob:
+                entry = float(ob["low"])
+                sl = entry - buffer
+                tp = entry + atr * 2.0
+                swing_tp = nearest_swing_target(analysis.get("swing_highs") or [], entry, "buy")
+                if swing_tp and swing_tp > entry + buffer:
+                    tp = swing_tp
+                order_type = "buy_limit" if entry < bid - min_dist else "buy_stop"
+                if order_type == "buy_stop" and entry <= ask:
+                    entry = ask + min_dist
+                setup = make_setup(
+                    order_type, "BUY", entry, sl, tp,
+                    f"Counter-trend BUY — {overall}, bullish OB below ({ob.get('volume_k', '?')}) · {ob.get('status', 'FRESH')}",
+                    "LOW", ob,
+                )
+        elif overall == "STRONG_UP":
+            bears = sorted(
+                [ob for ob in blocks if ob["type"] == "BEARISH_OB"],
+                key=lambda o: float(o["high"]),
+            )
+            ob = next((o for o in bears if float(o["high"]) > bid), bears[0] if bears else None)
+            if ob:
+                entry = float(ob["high"])
+                sl = entry + buffer
+                tp = entry - atr * 2.0
+                swing_tp = nearest_swing_target(analysis.get("swing_lows") or [], entry, "sell")
+                if swing_tp and swing_tp < entry - buffer:
+                    tp = swing_tp
+                order_type = "sell_limit" if entry > ask + min_dist else "sell_stop"
+                if order_type == "sell_stop" and entry <= ask:
+                    entry = ask + min_dist
+                setup = make_setup(
+                    order_type, "SELL", entry, sl, tp,
+                    f"Counter-trend SELL — {overall}, bearish OB above ({ob.get('volume_k', '?')}) · {ob.get('status', 'FRESH')}",
+                    "LOW", ob,
+                )
+
     if setup is None:
+        valid_n = len(blocks)
+        bears_n = sum(1 for o in blocks if o["type"] == "BEARISH_OB")
+        bulls_n = sum(1 for o in blocks if o["type"] == "BULLISH_OB")
+        if valid_n == 0:
+            message = "No valid OB — all zones broken, mitigated, or stale"
+        elif overall in ("STRONG_DOWN", "DOWN") and bears_n == 0:
+            message = f"{overall} — no valid bearish OB for sell ({bulls_n} bullish zone(s) only)"
+        elif overall in ("STRONG_UP", "UP") and bulls_n == 0:
+            message = f"{overall} — no valid bullish OB for buy ({bears_n} bearish zone(s) only)"
+        else:
+            message = f"No setup — {valid_n} valid OB(s) but none match current trend filter"
         return {
             "ok": True,
             "has_setup": False,
@@ -2148,7 +2205,8 @@ def build_trade_suggestion(sym: str, chart_tf: str, count: int = 200) -> dict[st
             "chart_timeframe": chart_tf,
             "overall_trend": overall,
             "price": bid,
-            "message": "No valid OB setup — all zones broken, mitigated, or stale",
+            "valid_ob_count": valid_n,
+            "message": message,
         }
 
     return {
