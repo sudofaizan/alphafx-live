@@ -13,6 +13,8 @@ Endpoints:
   GET  /getCandles?symbol=XAUUSD&timeframe=M5&count=100
   GET  /getAnalysis?symbol=XAUUSD&timeframe=M5
   GET  /getTradeSuggestion?symbol=XAUUSD&timeframe=M5
+  GET  /suggestionWatch/status
+  POST /suggestionWatch/stop
   POST /placeOrder
   POST /placeTrades
   GET  /getPositions
@@ -29,14 +31,18 @@ Endpoints:
   POST /basketTp/start    — auto TP+SL on all basket positions (+$ / -$ targets)
   POST /basketTp/stop
   GET  /basketTp/status
+  GET  /basketTp/status
   POST /basketTp/apply      — one-shot TP recalc
+  GET  /suggestionWatch/status
+  POST /suggestionWatch/stop
 """
 from __future__ import annotations
 
+import json
 import os
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
 from functools import wraps
 from typing import Any, Callable
@@ -48,12 +54,18 @@ from flask import Flask, jsonify, request
 # Config
 # ---------------------------------------------------------------------------
 API_KEY = "alphafx"
-API_VERSION = "1.5.3"
+API_VERSION = "1.6.0"
 MT5_PATH = os.environ.get("MT5_TERMINAL_PATH", "")
 HOST = "0.0.0.0"
 PORT = 8080
 DEFAULT_MAGIC = int(os.environ.get("MT5_DEFAULT_MAGIC", "202611"))
 TRAIL_POLL_MS = int(os.environ.get("TRAIL_POLL_MS", "200"))
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+SUGGESTION_WATCH_STATE_FILE = os.environ.get(
+    "SUGGESTION_WATCH_STATE_FILE",
+    os.path.join(SCRIPT_DIR, "suggestion_watch_state.json"),
+)
+SUGGESTION_WATCH_POLL_MS = int(os.environ.get("SUGGESTION_WATCH_POLL_MS", "2000"))
 
 TIMEFRAMES = {
     "M1": mt5.TIMEFRAME_M1,
@@ -506,6 +518,39 @@ def cancel_pending_orders(symbol: str | None = None, magic: int | None = None) -
         results.append({"ticket": o.ticket, "ok": ok})
 
     return {"cancelled": cancelled, "failed": failed, "total": len(orders), "results": results}
+
+
+def cancel_order_ticket(ticket: int) -> dict[str, Any]:
+    orders = mt5.orders_get(ticket=int(ticket))
+    if not orders:
+        return {"ok": False, "error": "order not found", "ticket": int(ticket)}
+    req = {"action": mt5.TRADE_ACTION_REMOVE, "order": int(ticket)}
+    ok, res = send_order(req)
+    return {"ok": ok, "ticket": int(ticket), "result": result_to_dict(res)}
+
+
+def modify_pending_order(
+    ticket: int,
+    price: float | None = None,
+    sl: float | None = None,
+    tp: float | None = None,
+) -> dict[str, Any]:
+    orders = mt5.orders_get(ticket=int(ticket))
+    if not orders:
+        return {"ok": False, "error": "order not found", "ticket": int(ticket)}
+    o = orders[0]
+    sym = o.symbol
+    req = {
+        "action": mt5.TRADE_ACTION_MODIFY,
+        "order": int(ticket),
+        "price": round_price(sym, price if price is not None else o.price_open),
+        "sl": round_price(sym, sl) if sl is not None else o.sl,
+        "tp": round_price(sym, tp) if tp is not None else o.tp,
+        "type_time": mt5.ORDER_TIME_GTC,
+        "type_filling": supported_filling(sym),
+    }
+    ok, res = send_order(req)
+    return {"ok": ok, "ticket": int(ticket), "result": result_to_dict(res)}
 
 
 def close_basket(symbol: str | None = None, magic: int | None = None, comment: str = "Grid guard close") -> dict[str, Any]:
@@ -1366,6 +1411,253 @@ basket_tp_mgr = BasketTpManager(poll_ms=1000)
 
 
 # ---------------------------------------------------------------------------
+# Suggestion watch — auto cancel/update pending orders when OB expires
+# ---------------------------------------------------------------------------
+@dataclass
+class SuggestionWatchJob:
+    ticket: int
+    symbol: str
+    magic: int
+    order_type: str
+    chart_tf: str
+    bar_count: int
+    ob_time: str
+    ob_type: str
+    entry: float
+    sl: float
+    tp: float
+    volume: float
+    active: bool = True
+    created_at: str = ""
+    last_check: str = ""
+    last_status: str = "watching"
+    last_message: str = ""
+    modify_count: int = 0
+
+
+def _find_ob_in_analysis(analysis: dict[str, Any], ob_time: str, ob_type: str) -> dict[str, Any] | None:
+    for ob in analysis.get("order_blocks") or []:
+        if ob.get("time") == ob_time and ob.get("type") == ob_type:
+            return ob
+    return None
+
+
+def _recalc_ob_order_prices(sym: str, ob: dict, ob_type: str, atr: float) -> tuple[float, float, float]:
+    info = mt5.symbol_info(sym)
+    pt = info.point if info else 0.01
+    min_dist = max(1, (info.trade_stops_level if info else 1)) * pt
+    buffer = max(atr * 0.35, min_dist * 2)
+    sl_pad = max(atr * 0.75, buffer, min_dist * 3)
+    if ob_type == "BULLISH_OB":
+        entry = float(ob["low"])
+        sl = float(ob["low"]) - sl_pad
+        tp = max(entry + atr * 2.0, entry + atr * 1.5)
+    else:
+        entry = float(ob["high"])
+        sl = float(ob["high"]) + sl_pad
+        tp = min(entry - atr * 2.0, entry - atr * 1.5)
+    return round_price(sym, entry), round_price(sym, sl), round_price(sym, tp)
+
+
+class SuggestionWatchManager:
+    """Persisted maintenance for analysis-based pending orders."""
+
+    def __init__(self, poll_ms: int = SUGGESTION_WATCH_POLL_MS):
+        self._jobs: dict[int, SuggestionWatchJob] = {}
+        self._lock = threading.Lock()
+        self._poll_ms = poll_ms
+        self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
+        self._load_state()
+
+    def _load_state(self) -> None:
+        if not os.path.isfile(SUGGESTION_WATCH_STATE_FILE):
+            return
+        try:
+            with open(SUGGESTION_WATCH_STATE_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+            for raw in data.get("jobs") or []:
+                job = SuggestionWatchJob(**raw)
+                if job.active:
+                    self._jobs[int(job.ticket)] = job
+            if self._jobs:
+                print(f"[SuggestionWatch] restored {len(self._jobs)} job(s) from state file")
+                self.start()
+        except Exception as exc:
+            print(f"[SuggestionWatch] state load failed: {exc}")
+
+    def _save_state(self) -> None:
+        try:
+            with self._lock:
+                payload = {
+                    "version": 1,
+                    "saved_at": datetime.utcnow().isoformat() + "Z",
+                    "jobs": [asdict(j) for j in self._jobs.values() if j.active],
+                }
+            tmp = SUGGESTION_WATCH_STATE_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+            os.replace(tmp, SUGGESTION_WATCH_STATE_FILE)
+        except Exception as exc:
+            print(f"[SuggestionWatch] state save failed: {exc}")
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._loop, daemon=True, name="suggestion-watch")
+        self._thread.start()
+
+    def add(
+        self,
+        ticket: int,
+        symbol: str,
+        magic: int,
+        order_type: str,
+        chart_tf: str,
+        bar_count: int,
+        ob_time: str,
+        ob_type: str,
+        entry: float,
+        sl: float,
+        tp: float,
+        volume: float,
+    ) -> dict[str, Any]:
+        job = SuggestionWatchJob(
+            ticket=int(ticket),
+            symbol=symbol,
+            magic=int(magic),
+            order_type=str(order_type),
+            chart_tf=str(chart_tf).upper(),
+            bar_count=int(bar_count),
+            ob_time=str(ob_time),
+            ob_type=str(ob_type),
+            entry=float(entry),
+            sl=float(sl),
+            tp=float(tp),
+            volume=float(volume),
+            created_at=datetime.utcnow().isoformat() + "Z",
+            last_status="watching",
+            last_message="Monitoring OB validity and updating SL/TP",
+        )
+        with self._lock:
+            self._jobs[job.ticket] = job
+        self._save_state()
+        self.start()
+        return {
+            "ok": True,
+            "ticket": job.ticket,
+            "message": f"Watching order #{job.ticket} — auto cancel if OB expires",
+            "state_file": SUGGESTION_WATCH_STATE_FILE,
+        }
+
+    def remove(self, ticket: int, status: str = "stopped", message: str = "") -> bool:
+        with self._lock:
+            job = self._jobs.pop(int(ticket), None)
+        if job:
+            job.active = False
+            job.last_status = status
+            if message:
+                job.last_message = message
+            self._save_state()
+            return True
+        return False
+
+    def remove_all(self) -> int:
+        with self._lock:
+            n = len(self._jobs)
+            self._jobs.clear()
+        self._save_state()
+        return n
+
+    def status(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [asdict(j) for j in self._jobs.values()]
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            with self._lock:
+                tickets = list(self._jobs.keys())
+            for ticket in tickets:
+                with self._lock:
+                    job = self._jobs.get(ticket)
+                if job and job.active:
+                    self._tick(job)
+            time.sleep(self._poll_ms / 1000.0)
+
+    def _finish(self, job: SuggestionWatchJob, status: str, message: str) -> None:
+        job.last_status = status
+        job.last_message = message
+        job.last_check = datetime.utcnow().isoformat() + "Z"
+        job.active = False
+        print(f"[SuggestionWatch] #{job.ticket} {status}: {message}")
+        self.remove(job.ticket, status=status, message=message)
+
+    def _tick(self, job: SuggestionWatchJob) -> None:
+        job.last_check = datetime.utcnow().isoformat() + "Z"
+        orders = mt5.orders_get(ticket=job.ticket)
+        if not orders:
+            positions = mt5.positions_get(symbol=job.symbol) or []
+            positions = [p for p in positions if p.magic == job.magic]
+            if positions:
+                self._finish(job, "filled", "Order filled — position open, watch stopped")
+            else:
+                self._finish(job, "removed_manual", "Pending order gone (cancelled manually in MT5)")
+            return
+
+        analysis = build_chart_analysis(job.symbol, job.chart_tf, job.bar_count)
+        if not analysis.get("ok"):
+            job.last_message = analysis.get("error", "analysis failed")
+            self._save_state()
+            return
+
+        ob = _find_ob_in_analysis(analysis, job.ob_time, job.ob_type)
+        if ob is None:
+            cancel_order_ticket(job.ticket)
+            self._finish(job, "cancelled_ob_missing", "OB no longer found on chart — order cancelled")
+            return
+
+        ob_status = ob.get("status", "")
+        if not ob.get("is_tradeable") or ob_status in ("BROKEN", "MITIGATED", "STALE"):
+            cancel_order_ticket(job.ticket)
+            self._finish(
+                job,
+                "cancelled_ob_expired",
+                f"OB {ob_status} — order cancelled automatically",
+            )
+            return
+
+        atr = float((analysis.get("chart") or {}).get("atr") or 2.0)
+        new_entry, new_sl, new_tp = _recalc_ob_order_prices(job.symbol, ob, job.ob_type, atr)
+        info = mt5.symbol_info(job.symbol)
+        pt = info.point if info else 0.01
+        tol = pt * 3
+
+        o = orders[0]
+        needs_modify = (
+            abs(new_entry - o.price_open) > tol
+            or abs(new_sl - o.sl) > tol
+            or abs(new_tp - o.tp) > tol
+        )
+        if needs_modify:
+            mod = modify_pending_order(job.ticket, price=new_entry, sl=new_sl, tp=new_tp)
+            if mod.get("ok"):
+                job.entry, job.sl, job.tp = new_entry, new_sl, new_tp
+                job.modify_count += 1
+                job.last_message = f"Updated order SL/TP (OB {ob_status})"
+            else:
+                job.last_message = f"Modify failed: {mod.get('error', 'unknown')}"
+        else:
+            job.last_message = f"Watching — OB {ob_status}, order still valid"
+
+        job.last_status = "watching"
+        self._save_state()
+
+
+suggestion_watch = SuggestionWatchManager()
+
+
+# ---------------------------------------------------------------------------
 # Auth / helpers
 # ---------------------------------------------------------------------------
 def require_api_key(fn: Callable) -> Callable:
@@ -1408,6 +1700,7 @@ def health():
         "account": account.login if account else None,
         "server": account.server if account else None,
         "trail_jobs": len(trail_mgr.status()),
+        "suggestion_watch_jobs": len(suggestion_watch.status()),
     })
 
 
@@ -2319,7 +2612,40 @@ def _execute_place_order(data: dict[str, Any]) -> tuple[dict[str, Any], int]:
 
     ok, result = send_order(req)
     if ok:
-        return {"ok": True, "request": {k: req[k] for k in req if k != "type_filling"}, "result": result_to_dict(result)}, 200
+        payload: dict[str, Any] = {
+            "ok": True,
+            "request": {k: req[k] for k in req if k != "type_filling"},
+            "result": result_to_dict(result),
+        }
+        if data.get("watch") and result is not None and getattr(result, "order", None):
+            meta = data.get("watch_meta") or {}
+            ob = meta.get("ob") or {}
+            ob_time = meta.get("ob_time") or ob.get("time")
+            ob_type = meta.get("ob_type") or ob.get("type")
+            chart_tf = meta.get("chart_timeframe") or data.get("chart_timeframe") or "M5"
+            bar_count = int(meta.get("count") or data.get("count") or 200)
+            if ob_time and ob_type:
+                sym = req["symbol"]
+                payload["suggestion_watch"] = suggestion_watch.add(
+                    ticket=int(result.order),
+                    symbol=sym,
+                    magic=int(req.get("magic", magic)),
+                    order_type=order_type,
+                    chart_tf=str(chart_tf),
+                    bar_count=bar_count,
+                    ob_time=str(ob_time),
+                    ob_type=str(ob_type),
+                    entry=float(req.get("price") or payload["request"].get("price") or 0),
+                    sl=float(req.get("sl") or payload["request"].get("sl") or 0),
+                    tp=float(req.get("tp") or payload["request"].get("tp") or 0),
+                    volume=float(volume),
+                )
+            else:
+                payload["suggestion_watch"] = {
+                    "ok": False,
+                    "error": "watch requires watch_meta.ob_time and ob_type",
+                }
+        return payload, 200
     return {"ok": False, "result": result_to_dict(result), **last_error()}, 400
 
 
@@ -2720,6 +3046,31 @@ def basket_tp_apply():
     return jsonify(result), (200 if result.get("ok") else 400)
 
 
+@app.route("/suggestionWatch/status", methods=["GET"])
+@require_api_key
+def suggestion_watch_status():
+    return jsonify({
+        "ok": True,
+        "state_file": SUGGESTION_WATCH_STATE_FILE,
+        "jobs": suggestion_watch.status(),
+    })
+
+
+@app.route("/suggestionWatch/stop", methods=["POST"])
+@require_api_key
+def suggestion_watch_stop():
+    """Stop watch job(s). Body: {ticket} or {all: true} — does not cancel MT5 order."""
+    data = json_body()
+    if data.get("all"):
+        removed = suggestion_watch.remove_all()
+        return jsonify({"ok": True, "removed": removed})
+    ticket = data.get("ticket")
+    if ticket is None:
+        return jsonify({"ok": False, "error": "ticket or all:true required"}), 400
+    removed = suggestion_watch.remove(int(ticket), status="stopped", message="Stopped via API")
+    return jsonify({"ok": removed, "ticket": int(ticket)})
+
+
 if __name__ == "__main__":
     ok, msg = ensure_mt5(MT5_PATH or None)
     print(f"[MT5] {msg}")
@@ -2727,4 +3078,5 @@ if __name__ == "__main__":
     trail_mgr.start()
     grid_guard.start()
     basket_tp_mgr.start()
+    suggestion_watch.start()
     app.run(host=HOST, port=PORT, threaded=True)
