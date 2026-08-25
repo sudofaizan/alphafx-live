@@ -65,7 +65,7 @@ from flask import Flask, jsonify, request
 # Config
 # ---------------------------------------------------------------------------
 API_KEY = "alphafx"
-API_VERSION = "1.7.5"
+API_VERSION = "1.7.6"
 MT5_PATH = os.environ.get("MT5_TERMINAL_PATH", "")
 HOST = "0.0.0.0"
 PORT = 8080
@@ -2224,6 +2224,123 @@ def calc_rsi(closes: list[float], period: int = 14) -> list[float]:
     return rsi
 
 
+def calc_rsi_aligned(closes: list[float], period: int = 14) -> list[float | None]:
+    """Wilder RSI aligned to each close index (None before warm-up)."""
+    n = len(closes)
+    out: list[float | None] = [None] * n
+    if n < period + 1:
+        return out
+    gains = [0.0] * n
+    losses = [0.0] * n
+    for i in range(1, n):
+        d = closes[i] - closes[i - 1]
+        gains[i] = max(d, 0.0)
+        losses[i] = max(-d, 0.0)
+    avg_gain = sum(gains[1 : period + 1]) / period
+    avg_loss = sum(losses[1 : period + 1]) / period
+    rs = avg_gain / avg_loss if avg_loss else 100.0
+    out[period] = 100.0 - (100.0 / (1.0 + rs))
+    for i in range(period + 1, n):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+        rs = avg_gain / avg_loss if avg_loss else 100.0
+        out[i] = 100.0 - (100.0 / (1.0 + rs))
+    return out
+
+
+def _bar_is_swing_low(bars: list[dict[str, Any]], i: int, left: int, right: int) -> bool:
+    lo = bars[i]["low"]
+    for j in range(i - left, i + right + 1):
+        if j == i:
+            continue
+        if j < 0 or j >= len(bars):
+            return False
+        if bars[j]["low"] <= lo:
+            return False
+    return True
+
+
+def _bar_is_swing_high(bars: list[dict[str, Any]], i: int, left: int, right: int) -> bool:
+    hi = bars[i]["high"]
+    for j in range(i - left, i + right + 1):
+        if j == i:
+            continue
+        if j < 0 or j >= len(bars):
+            return False
+        if bars[j]["high"] >= hi:
+            return False
+    return True
+
+
+def find_rsi_divergences(
+    bars: list[dict[str, Any]],
+    rsi_aligned: list[float | None],
+    pivot_left: int = 3,
+    pivot_right: int = 3,
+    min_gap: int = 5,
+    max_results: int = 8,
+) -> list[dict[str, Any]]:
+    """
+    TradingView-style RSI divergence:
+      Bullish — price lower low, RSI higher low (swing lows)
+      Bearish — price higher high, RSI lower high (swing highs)
+    """
+    divergences: list[dict[str, Any]] = []
+    piv_low: list[tuple[int, float, float]] = []
+    piv_high: list[tuple[int, float, float]] = []
+    period = 14
+    start = max(pivot_left, period)
+
+    def point(idx: int, price: float, rsi_val: float) -> dict[str, Any]:
+        t = datetime.utcfromtimestamp(bars[idx]["time"]).isoformat() + "Z"
+        return {
+            "time": t,
+            "price": round(price, 5),
+            "rsi": round(rsi_val, 2),
+        }
+
+    for k in range(start + pivot_right, len(bars) - 1):
+        i = k - pivot_right
+        if i < pivot_left or i >= len(bars) - pivot_right:
+            continue
+        ri = rsi_aligned[i]
+        if ri is None:
+            continue
+
+        if _bar_is_swing_low(bars, i, pivot_left, pivot_right):
+            piv_low.append((i, float(bars[i]["low"]), float(ri)))
+            if len(piv_low) >= 2:
+                i1, l1, r1 = piv_low[-2]
+                i2, l2, r2 = piv_low[-1]
+                if i2 - i1 >= min_gap and l2 < l1 - 1e-9 and r2 > r1 + 1e-9:
+                    divergences.append({
+                        "type": "bullish",
+                        "label": "Bull",
+                        "signal_time": datetime.utcfromtimestamp(bars[k]["time"]).isoformat() + "Z",
+                        "signal_index": k,
+                        "price": {"p1": point(i1, l1, r1), "p2": point(i2, l2, r2)},
+                        "rsi": {"p1": point(i1, l1, r1), "p2": point(i2, l2, r2)},
+                    })
+
+        if _bar_is_swing_high(bars, i, pivot_left, pivot_right):
+            piv_high.append((i, float(bars[i]["high"]), float(ri)))
+            if len(piv_high) >= 2:
+                i1, h1, r1 = piv_high[-2]
+                i2, h2, r2 = piv_high[-1]
+                if i2 - i1 >= min_gap and h2 > h1 + 1e-9 and r2 < r1 - 1e-9:
+                    divergences.append({
+                        "type": "bearish",
+                        "label": "Bear",
+                        "signal_time": datetime.utcfromtimestamp(bars[k]["time"]).isoformat() + "Z",
+                        "signal_index": k,
+                        "price": {"p1": point(i1, h1, r1), "p2": point(i2, h2, r2)},
+                        "rsi": {"p1": point(i1, h1, r1), "p2": point(i2, h2, r2)},
+                    })
+
+    divergences.sort(key=lambda d: d["signal_index"], reverse=True)
+    return divergences[:max_results]
+
+
 def rates_to_bars(rates) -> list[dict[str, Any]]:
     bars = []
     for r in rates:
@@ -2533,6 +2650,11 @@ def build_chart_analysis(sym: str, chart_tf: str, count: int = 200) -> dict[str,
         {"time": datetime.utcfromtimestamp(bars[rsi_offset + i]["time"]).isoformat() + "Z", "rsi": round(rsi_series[i], 2)}
         for i in range(len(rsi_series))
     ]
+    rsi_aligned = calc_rsi_aligned(closes)
+    rsi_divergences = find_rsi_divergences(bars, rsi_aligned)
+    latest_div = rsi_divergences[0] if rsi_divergences else None
+    bull_div_n = sum(1 for d in rsi_divergences if d["type"] == "bullish")
+    bear_div_n = sum(1 for d in rsi_divergences if d["type"] == "bearish")
 
     ema20 = calc_ema(closes, 20)
     ema50 = calc_ema(closes, 50)
@@ -2590,13 +2712,18 @@ def build_chart_analysis(sym: str, chart_tf: str, count: int = 200) -> dict[str,
             "trend": calculate_trend(bars),
             "rsi": round(rsi_series[-1], 1) if rsi_series else None,
             "rsi_signal": mtf.get(chart_tf, {}).get("rsi_signal"),
+            "rsi_divergence": latest_div["type"] if latest_div else None,
+            "rsi_divergence_label": latest_div["label"] if latest_div else None,
+            "rsi_divergence_bull_count": bull_div_n,
+            "rsi_divergence_bear_count": bear_div_n,
             "atr": round(
                 sum(max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1]))
                     for i in range(1, min(15, len(closes)))) / 14,
                 2,
             ) if len(closes) > 14 else None,
         },
-        "rsi_series": rsi_points[-80:],
+        "rsi_series": rsi_points[-120:],
+        "rsi_divergences": rsi_divergences,
         "ema20": ema20_pts[-80:],
         "ema50": ema50_pts[-80:],
         "order_blocks": order_blocks,
