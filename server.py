@@ -11,6 +11,7 @@ Endpoints:
   GET  /getPrice?symbol=XAUUSD
   GET  /getCandles?symbol=XAUUSD&timeframe=M5&count=100
   GET  /getAnalysis?symbol=XAUUSD&timeframe=M5
+  GET  /getTradeSuggestion?symbol=XAUUSD&timeframe=M5
   POST /placeOrder
   POST /placeTrades
   GET  /getPositions
@@ -1400,7 +1401,7 @@ def health():
     return jsonify({
         "ok": ok,
         "service": "mt5-vps-trade-api",
-        "version": "1.3.0",
+        "version": "1.4.0",
         "mt5": msg,
         "account": account.login if account else None,
         "server": account.server if account else None,
@@ -1821,6 +1822,160 @@ def build_chart_analysis(sym: str, chart_tf: str, count: int = 200) -> dict[str,
     }
 
 
+def build_trade_suggestion(sym: str, chart_tf: str, count: int = 200) -> dict[str, Any]:
+    """Suggest pending order (limit/stop) from trend + order-block analysis."""
+    analysis = build_chart_analysis(sym, chart_tf, count)
+    if not analysis.get("ok"):
+        return analysis
+
+    info = mt5.symbol_info(sym)
+    tick = mt5.symbol_info_tick(sym)
+    if not info or not tick:
+        return {"ok": False, "error": "no quote"}
+
+    bid, ask = tick.bid, tick.ask
+    atr = float(analysis["chart"].get("atr") or 5.0)
+    pt = info.point
+    min_dist = max(1, info.trade_stops_level) * pt
+    buffer = max(atr * 0.35, min_dist * 2)
+
+    overall = analysis["overall_trend"]
+    rsi_obs = list(analysis.get("rsi_order_blocks") or [])
+    all_obs = list(analysis.get("order_blocks") or [])
+    blocks = sorted(rsi_obs or all_obs, key=lambda o: o.get("intensity", 0), reverse=True)
+
+    def rr_ratio(entry: float, sl: float, tp: float) -> float:
+        risk = abs(entry - sl)
+        reward = abs(tp - entry)
+        return round(reward / risk, 2) if risk > 0 else 0.0
+
+    def nearest_swing_target(levels: list[dict], entry: float, side: str) -> float | None:
+        prices = [float(x["price"]) for x in levels]
+        if side == "sell":
+            below = [p for p in prices if p < entry - buffer]
+            return max(below) if below else None
+        above = [p for p in prices if p > entry + buffer]
+        return min(above) if above else None
+
+    def make_setup(
+        order_type: str,
+        side: str,
+        entry: float,
+        sl: float,
+        tp: float,
+        reason: str,
+        confidence: str,
+        ob: dict | None,
+    ) -> dict[str, Any]:
+        entry = round_price(sym, entry)
+        sl = round_price(sym, sl)
+        tp = round_price(sym, tp)
+        return {
+            "has_setup": True,
+            "side": side,
+            "order_type": order_type,
+            "entry": entry,
+            "sl": sl,
+            "tp": tp,
+            "rr": rr_ratio(entry, sl, tp),
+            "confidence": confidence,
+            "reason": reason,
+            "bid": bid,
+            "ask": ask,
+            "atr": atr,
+            "overall_trend": overall,
+            "ob": ob,
+        }
+
+    setup: dict[str, Any] | None = None
+
+    # --- Trend-following: SELL at bearish OB ---
+    if overall in ("STRONG_DOWN", "DOWN"):
+        bears = [ob for ob in blocks if ob["type"] == "BEARISH_OB"]
+        bears_above = sorted([ob for ob in bears if ob["high"] > bid], key=lambda o: o["high"])
+        ob = bears_above[0] if bears_above else (bears[0] if bears else None)
+        if ob:
+            entry = float(ob["high"])
+            sl = entry + buffer
+            tp = entry - atr * 2.0
+            swing_tp = nearest_swing_target(analysis.get("swing_lows") or [], entry, "sell")
+            if swing_tp and swing_tp < entry - buffer:
+                tp = swing_tp
+            order_type = "sell_limit" if entry > ask + min_dist else "sell_stop"
+            if order_type == "sell_stop" and entry <= ask:
+                entry = ask + min_dist
+            conf = ob.get("intensity_tier", "MED") if ob.get("rsi_ob") else "MED"
+            setup = make_setup(
+                order_type, "SELL", entry, sl, tp,
+                f"{overall} — sell retest bearish OB ({ob.get('volume_k', '?')})",
+                conf, ob,
+            )
+
+    # --- Trend-following: BUY at bullish OB ---
+    elif overall in ("STRONG_UP", "UP"):
+        bulls = [ob for ob in blocks if ob["type"] == "BULLISH_OB"]
+        bulls_below = sorted([ob for ob in bulls if ob["low"] < ask], key=lambda o: -o["low"])
+        ob = bulls_below[0] if bulls_below else (bulls[0] if bulls else None)
+        if ob:
+            entry = float(ob["low"])
+            sl = entry - buffer
+            tp = entry + atr * 2.0
+            swing_tp = nearest_swing_target(analysis.get("swing_highs") or [], entry, "buy")
+            if swing_tp and swing_tp > entry + buffer:
+                tp = swing_tp
+            order_type = "buy_limit" if entry < bid - min_dist else "buy_stop"
+            if order_type == "buy_stop" and entry <= ask:
+                entry = ask + min_dist
+            conf = ob.get("intensity_tier", "MED") if ob.get("rsi_ob") else "MED"
+            setup = make_setup(
+                order_type, "BUY", entry, sl, tp,
+                f"{overall} — buy retest bullish OB ({ob.get('volume_k', '?')})",
+                conf, ob,
+            )
+
+    # --- Neutral / counter-trend: best RSI OB ---
+    if setup is None and rsi_obs:
+        ob = rsi_obs[0]
+        if ob["type"] == "BULLISH_OB":
+            entry = float(ob["low"])
+            sl = entry - buffer
+            tp = entry + atr * 2.0
+            order_type = "buy_limit" if entry < bid - min_dist else "buy_stop"
+            setup = make_setup(
+                order_type, "BUY", entry, sl, tp,
+                f"RSI bullish OB ({ob.get('volume_k', '?')} · RSI {ob.get('rsi')})",
+                ob.get("intensity_tier", "LOW"), ob,
+            )
+        elif ob["type"] == "BEARISH_OB":
+            entry = float(ob["high"])
+            sl = entry + buffer
+            tp = entry - atr * 2.0
+            order_type = "sell_limit" if entry > ask + min_dist else "sell_stop"
+            setup = make_setup(
+                order_type, "SELL", entry, sl, tp,
+                f"RSI bearish OB ({ob.get('volume_k', '?')} · RSI {ob.get('rsi')})",
+                ob.get("intensity_tier", "LOW"), ob,
+            )
+
+    if setup is None:
+        return {
+            "ok": True,
+            "has_setup": False,
+            "symbol": sym,
+            "chart_timeframe": chart_tf,
+            "overall_trend": overall,
+            "price": bid,
+            "message": "No OB retest setup — wait for price at order block",
+        }
+
+    return {
+        "ok": True,
+        "symbol": sym,
+        "chart_timeframe": chart_tf,
+        **setup,
+    }
+
+
 @app.route("/getAnalysis", methods=["GET"])
 @require_api_key
 @require_mt5
@@ -1838,6 +1993,26 @@ def get_analysis():
     if info is None:
         return jsonify({"ok": False, "error": f"symbol not found: {symbol}"}), 404
     result = build_chart_analysis(sym, chart_tf, count)
+    return jsonify(result), (200 if result.get("ok") else 400)
+
+
+@app.route("/getTradeSuggestion", methods=["GET"])
+@require_api_key
+@require_mt5
+def get_trade_suggestion():
+    """
+    Suggested pending order from analysis: type, entry, SL, TP, R:R.
+    ?symbol=XAUUSD&timeframe=M5&count=200
+    """
+    symbol = request.args.get("symbol", "").strip()
+    if not symbol:
+        return jsonify({"ok": False, "error": "symbol required"}), 400
+    chart_tf = request.args.get("timeframe", "M5").upper()
+    count = max(50, min(int(request.args.get("count", 200)), 5000))
+    info, sym = resolve_symbol(symbol)
+    if info is None:
+        return jsonify({"ok": False, "error": f"symbol not found: {symbol}"}), 404
+    result = build_trade_suggestion(sym, chart_tf, count)
     return jsonify(result), (200 if result.get("ok") else 400)
 
 
