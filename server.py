@@ -40,6 +40,7 @@ Endpoints:
   POST /suggestionWatch/stop
   POST /telegramAlerts/start   — candle-close OB signals to Telegram
   POST /telegramAlerts/stop
+  POST /telegramAlerts/test
   GET  /telegramAlerts/status
 """
 from __future__ import annotations
@@ -62,7 +63,7 @@ from flask import Flask, jsonify, request
 # Config
 # ---------------------------------------------------------------------------
 API_KEY = "alphafx"
-API_VERSION = "1.7.1"
+API_VERSION = "1.7.2"
 MT5_PATH = os.environ.get("MT5_TERMINAL_PATH", "")
 HOST = "0.0.0.0"
 PORT = 8080
@@ -1903,6 +1904,28 @@ class TelegramAlertManager:
             "notifications": "off",
         }
 
+    def send_test(self) -> dict[str, Any]:
+        """Send a one-off test message to verify bot + channel."""
+        if not TELEGRAM_BOT_TOKEN.strip():
+            return {"ok": False, "error": "TELEGRAM_BOT_TOKEN not set on server"}
+        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+        msg = (
+            "<b>🧪 AlphaFX Test Notification</b>\n\n"
+            "Telegram connection is working.\n"
+            f"<b>Channel:</b> {_html_escape(TELEGRAM_CHAT_ID)}\n"
+            f"<b>API:</b> {_html_escape(API_VERSION)}\n"
+            f"<b>Time:</b> {now}"
+        )
+        tg = send_telegram_message(msg)
+        if tg.get("ok"):
+            return {
+                "ok": True,
+                "message": "Test notification sent",
+                "channel": TELEGRAM_CHAT_ID,
+                "message_id": tg.get("message_id"),
+            }
+        return {"ok": False, "error": tg.get("error", "telegram send failed")}
+
     def _ensure_thread(self) -> None:
         if self._thread and self._thread.is_alive():
             return
@@ -3443,9 +3466,17 @@ def telegram_alerts_start():
 @app.route("/telegramAlerts/stop", methods=["POST"])
 @require_api_key
 def telegram_alerts_stop():
-    """Stop Telegram monitoring and send stop message to channel."""
+    """Stop Telegram monitoring."""
     result = telegram_alerts.stop()
     return jsonify(result)
+
+
+@app.route("/telegramAlerts/test", methods=["POST"])
+@require_api_key
+def telegram_alerts_test():
+    """Send a test message to the configured Telegram channel."""
+    result = telegram_alerts.send_test()
+    return jsonify(result), (200 if result.get("ok") else 400)
 
 
 if __name__ == "__main__":
