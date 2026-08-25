@@ -12,7 +12,7 @@ Endpoints:
   GET  /getPrice?symbol=XAUUSD
   GET  /getCandles?symbol=XAUUSD&timeframe=M5&count=100
   GET  /getAnalysis?symbol=XAUUSD&timeframe=M5
-  GET  /getTradeSuggestion?symbol=XAUUSD&timeframe=M5
+  GET  /getUpcomingNews?hours=72&impact=High&currency=USD
   GET  /suggestionWatch/status
   POST /suggestionWatch/stop
   GET  /telegramAlerts/status
@@ -53,7 +53,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from functools import wraps
 from typing import Any, Callable
 
@@ -65,7 +65,7 @@ from flask import Flask, jsonify, request
 # Config
 # ---------------------------------------------------------------------------
 API_KEY = "alphafx"
-API_VERSION = "1.7.6"
+API_VERSION = "1.7.8"
 MT5_PATH = os.environ.get("MT5_TERMINAL_PATH", "")
 HOST = "0.0.0.0"
 PORT = 8080
@@ -85,6 +85,11 @@ TELEGRAM_ALERT_STATE_FILE = os.environ.get(
 )
 TELEGRAM_ALERT_POLL_MS = int(os.environ.get("TELEGRAM_ALERT_POLL_MS", "5000"))
 TELEGRAM_ALERT_TIMEFRAMES = ["M1", "M5", "M15", "M30", "H1"]
+NEWS_CALENDAR_URL = os.environ.get(
+    "NEWS_CALENDAR_URL",
+    "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
+)
+NEWS_CACHE_TTL = int(os.environ.get("NEWS_CACHE_TTL", "300"))
 
 TIMEFRAMES = {
     "M1": mt5.TIMEFRAME_M1,
@@ -2066,6 +2071,99 @@ def json_body() -> dict[str, Any]:
     return request.get_json(silent=True) or {}
 
 
+_news_cache_lock = threading.Lock()
+_news_cache: dict[str, Any] = {"fetched_at": 0.0, "raw": []}
+
+
+def _http_get_json(url: str, timeout: int = 20) -> Any:
+    req = urllib.request.Request(url, headers={"User-Agent": f"AlphaFX-MT5-API/{API_VERSION}"})
+    ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+    with urllib.request.urlopen(req, timeout=timeout, context=ssl_ctx) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _load_ff_calendar_raw() -> list[dict[str, Any]]:
+    now = time.time()
+    with _news_cache_lock:
+        if now - float(_news_cache.get("fetched_at", 0)) < NEWS_CACHE_TTL and _news_cache.get("raw"):
+            return list(_news_cache["raw"])
+
+    merged: list[dict[str, Any]] = []
+    try:
+        data = _http_get_json(NEWS_CALENDAR_URL)
+        if isinstance(data, list):
+            merged.extend(data)
+    except Exception:
+        merged = []
+
+    with _news_cache_lock:
+        _news_cache["fetched_at"] = now
+        _news_cache["raw"] = merged
+    return merged
+
+
+def _parse_ff_event_time(date_s: str) -> datetime | None:
+    try:
+        return datetime.fromisoformat(date_s.replace("Z", "+00:00")).astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def build_upcoming_news(
+    hours_ahead: int = 72,
+    impact: str = "High",
+    currencies: list[str] | None = None,
+) -> dict[str, Any]:
+    """High-impact (red folder) events from Forex Factory calendar feed."""
+    raw = _load_ff_calendar_raw()
+    now = datetime.now(timezone.utc)
+    end = now + timedelta(hours=hours_ahead)
+    impact_key = (impact or "High").strip().lower()
+    currency_set = {c.upper() for c in currencies} if currencies else None
+
+    events: list[dict[str, Any]] = []
+    for item in raw:
+        item_impact = str(item.get("impact", "")).strip().lower()
+        if item_impact != impact_key:
+            continue
+
+        currency = str(item.get("country", "")).strip().upper()
+        if currency_set and currency not in currency_set:
+            continue
+
+        dt = _parse_ff_event_time(str(item.get("date", "")))
+        if dt is None:
+            continue
+        if dt < now - timedelta(minutes=30):
+            continue
+        if dt > end:
+            continue
+
+        minutes_until = int((dt - now).total_seconds() // 60)
+        events.append({
+            "title": str(item.get("title", "")).strip(),
+            "currency": currency,
+            "country": currency,
+            "impact": str(item.get("impact", impact)).strip(),
+            "time": dt.isoformat().replace("+00:00", "Z"),
+            "forecast": item.get("forecast") or "—",
+            "previous": item.get("previous") or "—",
+            "minutes_until": minutes_until,
+            "is_imminent": -5 <= minutes_until <= 30,
+            "is_past": minutes_until < -5,
+        })
+
+    events.sort(key=lambda e: e["time"])
+    return {
+        "ok": True,
+        "source": "forex_factory",
+        "impact_filter": impact,
+        "hours_ahead": hours_ahead,
+        "count": len(events),
+        "events": events,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -2095,6 +2193,34 @@ def get_version():
         "version": API_VERSION,
         "file": "server.py",
     })
+
+
+@app.route("/getUpcomingNews", methods=["GET"])
+@require_api_key
+def get_upcoming_news():
+    """Upcoming high-impact (red folder) macro events from Forex Factory feed."""
+    try:
+        hours = int(request.args.get("hours", 72))
+    except (TypeError, ValueError):
+        hours = 72
+    hours = min(168, max(1, hours))
+
+    impact = (request.args.get("impact", "High") or "High").strip()
+    cur = (request.args.get("currency", "") or "").strip()
+    currencies = [c.strip().upper() for c in cur.split(",") if c.strip()] or None
+
+    try:
+        payload = build_upcoming_news(hours_ahead=hours, impact=impact, currencies=currencies)
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 502
+
+    if not payload.get("events") and not _news_cache.get("raw"):
+        return jsonify({
+            "ok": False,
+            "error": "calendar feed unavailable",
+            "source": "forex_factory",
+        }), 502
+    return jsonify(payload)
 
 
 @app.route("/getAccountHealth", methods=["GET"])
