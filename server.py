@@ -65,7 +65,7 @@ from flask import Flask, jsonify, request
 # Config
 # ---------------------------------------------------------------------------
 API_KEY = "alphafx"
-API_VERSION = "1.7.4"
+API_VERSION = "1.7.5"
 MT5_PATH = os.environ.get("MT5_TERMINAL_PATH", "")
 HOST = "0.0.0.0"
 PORT = 8080
@@ -2682,9 +2682,19 @@ def build_trade_suggestion(
             tp = swing_tp
         return entry, sl, min(tp, entry - atr * 1.5)
 
+    def clamp_tp_rr(side: str, entry: float, sl: float, tp: float, max_rr: float) -> float:
+        risk = abs(entry - sl)
+        if risk <= 0:
+            return tp
+        if side == "BUY":
+            cap = entry + risk * max_rr
+            return min(tp, cap) if tp > entry else tp
+        cap = entry - risk * max_rr
+        return max(tp, cap) if tp < entry else tp
+
     def setup_issues(
         side: str, entry: float, sl: float, tp: float, ob: dict,
-        max_dist_atr: float = 2.5, risky: bool = False,
+        max_dist_atr: float = 2.5, risky: bool = False, selected: bool = False,
     ) -> list[str]:
         issues: list[str] = []
         risk = abs(entry - sl)
@@ -2697,19 +2707,19 @@ def build_trade_suggestion(
         if side == "BUY":
             if tp <= entry + min_dist:
                 issues.append("TP must be above entry")
-            if not risky and entry >= bid - min_dist and ob.get("status") != "AT_ZONE":
+            if not risky and not selected and entry >= bid - min_dist and ob.get("status") != "AT_ZONE":
                 issues.append("entry not below market for buy limit")
         else:
             if tp >= entry - min_dist:
                 issues.append("TP must be below entry")
-            if not risky and entry <= ask + min_dist and ob.get("status") != "AT_ZONE":
+            if not risky and not selected and entry <= ask + min_dist and ob.get("status") != "AT_ZONE":
                 issues.append("entry not above market for sell limit")
         rr = reward / risk if risk else 0
         if rr < min_rr:
             issues.append(f"R:R too low ({rr:.1f})")
         if rr > max_rr:
             issues.append(f"R:R unrealistic ({rr:.1f})")
-        if not risky:
+        if not risky and not selected:
             dist = float(ob.get("distance_atr") or 0)
             if dist > max_dist_atr and ob.get("status") not in ("FRESH", "AT_ZONE"):
                 issues.append(f"zone {dist}x ATR away — wait for closer retest")
@@ -2728,9 +2738,12 @@ def build_trade_suggestion(
         ob: dict,
         max_dist_atr: float = 2.5,
         risky: bool = False,
+        selected: bool = False,
     ) -> bool:
         nonlocal setup
-        bad = setup_issues(side, entry, sl, tp, ob, max_dist_atr=max_dist_atr, risky=risky)
+        bad = setup_issues(
+            side, entry, sl, tp, ob, max_dist_atr=max_dist_atr, risky=risky, selected=selected,
+        )
         if bad:
             last_reject[:] = bad
             return False
@@ -2789,11 +2802,14 @@ def build_trade_suggestion(
         ob = target
         status = ob.get("status", "FRESH")
         status_label = ob.get("status_label") or status
-        max_dist = 8.0 if use_risky else 4.0
+        max_rr_sel = 5.0 if use_risky else 4.0
         conf = "RISKY" if use_risky else ob.get("intensity_tier", "MED")
+        if status == "TESTED" and not use_risky:
+            conf = "MED"
         prefix = "⚠️ RISKY — " if use_risky else ""
         if ob["type"] == "BEARISH_OB":
             entry, sl, tp = prices_for_sell_ob(ob)
+            side = "SELL"
             if ob.get("status") == "AT_ZONE":
                 order_type, entry = "sell", bid
                 sl = float(ob["high"]) + sl_pad
@@ -2801,13 +2817,15 @@ def build_trade_suggestion(
                 order_type = "sell_limit" if entry > ask + min_dist else "sell_stop"
                 if order_type == "sell_stop" and entry <= ask:
                     entry = ask + min_dist
+            tp = clamp_tp_rr(side, entry, sl, tp, max_rr_sel)
             try_setup(
-                order_type, "SELL", entry, sl, tp,
+                order_type, side, entry, sl, tp,
                 f"{prefix}bearish OB ({ob.get('volume_k', '?')}) · {status} — {status_label}",
-                conf, ob, max_dist_atr=max_dist, risky=use_risky,
+                conf, ob, risky=use_risky, selected=True,
             )
         else:
             entry, sl, tp = prices_for_buy_ob(ob)
+            side = "BUY"
             if ob.get("status") == "AT_ZONE":
                 order_type, entry = "buy", ask
                 sl = float(ob["low"]) - sl_pad
@@ -2815,10 +2833,11 @@ def build_trade_suggestion(
                 order_type = "buy_limit" if entry < bid - min_dist else "buy_stop"
                 if order_type == "buy_stop" and entry <= ask:
                     entry = ask + min_dist
+            tp = clamp_tp_rr(side, entry, sl, tp, max_rr_sel)
             try_setup(
-                order_type, "BUY", entry, sl, tp,
+                order_type, side, entry, sl, tp,
                 f"{prefix}bullish OB ({ob.get('volume_k', '?')}) · {status} — {status_label}",
-                conf, ob, max_dist_atr=max_dist, risky=use_risky,
+                conf, ob, risky=use_risky, selected=True,
             )
         if setup:
             return {"ok": True, "symbol": sym, "chart_timeframe": chart_tf, **setup}
