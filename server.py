@@ -65,7 +65,7 @@ from flask import Flask, jsonify, request
 # Config
 # ---------------------------------------------------------------------------
 API_KEY = "alphafx"
-API_VERSION = "1.7.3"
+API_VERSION = "1.7.4"
 MT5_PATH = os.environ.get("MT5_TERMINAL_PATH", "")
 HOST = "0.0.0.0"
 PORT = 8080
@@ -2618,7 +2618,14 @@ def build_chart_analysis(sym: str, chart_tf: str, count: int = 200) -> dict[str,
     }
 
 
-def build_trade_suggestion(sym: str, chart_tf: str, count: int = 200) -> dict[str, Any]:
+def build_trade_suggestion(
+    sym: str,
+    chart_tf: str,
+    count: int = 200,
+    ob_time: str | None = None,
+    ob_type: str | None = None,
+    risky: bool = False,
+) -> dict[str, Any]:
     """Suggest pending order (limit/stop) from trend + order-block analysis."""
     analysis = build_chart_analysis(sym, chart_tf, count)
     if not analysis.get("ok"):
@@ -2676,31 +2683,36 @@ def build_trade_suggestion(sym: str, chart_tf: str, count: int = 200) -> dict[st
         return entry, sl, min(tp, entry - atr * 1.5)
 
     def setup_issues(
-        side: str, entry: float, sl: float, tp: float, ob: dict, max_dist_atr: float = 2.5,
+        side: str, entry: float, sl: float, tp: float, ob: dict,
+        max_dist_atr: float = 2.5, risky: bool = False,
     ) -> list[str]:
         issues: list[str] = []
         risk = abs(entry - sl)
         reward = abs(tp - entry)
-        if risk < atr * 0.5:
+        min_risk_atr = 0.35 if risky else 0.5
+        min_rr = 0.8 if risky else 1.0
+        max_rr = 5.0 if risky else 4.0
+        if risk < atr * min_risk_atr:
             issues.append("SL too tight for current ATR")
         if side == "BUY":
             if tp <= entry + min_dist:
                 issues.append("TP must be above entry")
-            if entry >= bid - min_dist and ob.get("status") != "AT_ZONE":
+            if not risky and entry >= bid - min_dist and ob.get("status") != "AT_ZONE":
                 issues.append("entry not below market for buy limit")
         else:
             if tp >= entry - min_dist:
                 issues.append("TP must be below entry")
-            if entry <= ask + min_dist and ob.get("status") != "AT_ZONE":
+            if not risky and entry <= ask + min_dist and ob.get("status") != "AT_ZONE":
                 issues.append("entry not above market for sell limit")
         rr = reward / risk if risk else 0
-        if rr < 1.0:
+        if rr < min_rr:
             issues.append(f"R:R too low ({rr:.1f})")
-        if rr > 4.0:
+        if rr > max_rr:
             issues.append(f"R:R unrealistic ({rr:.1f})")
-        dist = float(ob.get("distance_atr") or 0)
-        if dist > max_dist_atr and ob.get("status") not in ("FRESH", "AT_ZONE"):
-            issues.append(f"zone {dist}x ATR away — wait for closer retest")
+        if not risky:
+            dist = float(ob.get("distance_atr") or 0)
+            if dist > max_dist_atr and ob.get("status") not in ("FRESH", "AT_ZONE"):
+                issues.append(f"zone {dist}x ATR away — wait for closer retest")
         return issues
 
     last_reject: list[str] = []
@@ -2715,13 +2727,14 @@ def build_trade_suggestion(sym: str, chart_tf: str, count: int = 200) -> dict[st
         confidence: str,
         ob: dict,
         max_dist_atr: float = 2.5,
+        risky: bool = False,
     ) -> bool:
         nonlocal setup
-        bad = setup_issues(side, entry, sl, tp, ob, max_dist_atr=max_dist_atr)
+        bad = setup_issues(side, entry, sl, tp, ob, max_dist_atr=max_dist_atr, risky=risky)
         if bad:
             last_reject[:] = bad
             return False
-        setup = make_setup(order_type, side, entry, sl, tp, reason, confidence, ob)
+        setup = make_setup(order_type, side, entry, sl, tp, reason, confidence, ob, risky=risky)
         return True
 
     def make_setup(
@@ -2733,11 +2746,12 @@ def build_trade_suggestion(sym: str, chart_tf: str, count: int = 200) -> dict[st
         reason: str,
         confidence: str,
         ob: dict | None,
+        risky: bool = False,
     ) -> dict[str, Any]:
         entry = round_price(sym, entry)
         sl = round_price(sym, sl)
         tp = round_price(sym, tp)
-        return {
+        result = {
             "has_setup": True,
             "side": side,
             "order_type": order_type,
@@ -2752,9 +2766,72 @@ def build_trade_suggestion(sym: str, chart_tf: str, count: int = 200) -> dict[st
             "atr": atr,
             "overall_trend": overall,
             "ob": ob,
+            "risky": risky,
         }
+        return result
 
     setup: dict[str, Any] | None = None
+
+    # --- Clicked OB: build suggestion for that zone (risky if mitigated/broken/stale) ---
+    if ob_time and ob_type:
+        target = _find_ob_in_analysis(analysis, ob_time, ob_type)
+        if target is None:
+            return {
+                "ok": True,
+                "has_setup": False,
+                "symbol": sym,
+                "chart_timeframe": chart_tf,
+                "overall_trend": overall,
+                "price": bid,
+                "message": "Selected order block not found on chart",
+            }
+        use_risky = risky or not target.get("is_tradeable", True)
+        ob = target
+        status = ob.get("status", "FRESH")
+        status_label = ob.get("status_label") or status
+        max_dist = 8.0 if use_risky else 4.0
+        conf = "RISKY" if use_risky else ob.get("intensity_tier", "MED")
+        prefix = "⚠️ RISKY — " if use_risky else ""
+        if ob["type"] == "BEARISH_OB":
+            entry, sl, tp = prices_for_sell_ob(ob)
+            if ob.get("status") == "AT_ZONE":
+                order_type, entry = "sell", bid
+                sl = float(ob["high"]) + sl_pad
+            else:
+                order_type = "sell_limit" if entry > ask + min_dist else "sell_stop"
+                if order_type == "sell_stop" and entry <= ask:
+                    entry = ask + min_dist
+            try_setup(
+                order_type, "SELL", entry, sl, tp,
+                f"{prefix}bearish OB ({ob.get('volume_k', '?')}) · {status} — {status_label}",
+                conf, ob, max_dist_atr=max_dist, risky=use_risky,
+            )
+        else:
+            entry, sl, tp = prices_for_buy_ob(ob)
+            if ob.get("status") == "AT_ZONE":
+                order_type, entry = "buy", ask
+                sl = float(ob["low"]) - sl_pad
+            else:
+                order_type = "buy_limit" if entry < bid - min_dist else "buy_stop"
+                if order_type == "buy_stop" and entry <= ask:
+                    entry = ask + min_dist
+            try_setup(
+                order_type, "BUY", entry, sl, tp,
+                f"{prefix}bullish OB ({ob.get('volume_k', '?')}) · {status} — {status_label}",
+                conf, ob, max_dist_atr=max_dist, risky=use_risky,
+            )
+        if setup:
+            return {"ok": True, "symbol": sym, "chart_timeframe": chart_tf, **setup}
+        return {
+            "ok": True,
+            "has_setup": False,
+            "symbol": sym,
+            "chart_timeframe": chart_tf,
+            "overall_trend": overall,
+            "price": bid,
+            "risky": use_risky,
+            "message": f"No setup for selected OB — {'; '.join(last_reject) if last_reject else 'filters rejected'}",
+        }
 
     # --- Trend-following: SELL at bearish OB ---
     if overall in ("STRONG_DOWN", "DOWN"):
@@ -2941,10 +3018,13 @@ def get_trade_suggestion():
         return jsonify({"ok": False, "error": "symbol required"}), 400
     chart_tf = request.args.get("timeframe", "M5").upper()
     count = max(50, min(int(request.args.get("count", 200)), 5000))
+    ob_time = request.args.get("ob_time", "").strip() or None
+    ob_type = request.args.get("ob_type", "").strip() or None
+    risky = request.args.get("risky", "").lower() in ("1", "true", "yes")
     info, sym = resolve_symbol(symbol)
     if info is None:
         return jsonify({"ok": False, "error": f"symbol not found: {symbol}"}), 404
-    result = build_trade_suggestion(sym, chart_tf, count)
+    result = build_trade_suggestion(sym, chart_tf, count, ob_time=ob_time, ob_type=ob_type, risky=risky)
     return jsonify(result), (200 if result.get("ok") else 400)
 
 
