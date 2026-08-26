@@ -64,6 +64,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 from typing import Any, Callable
+from zoneinfo import ZoneInfo
 
 import certifi
 import MetaTrader5 as mt5
@@ -2428,15 +2429,20 @@ def parse_timeout_mmss(value: str | None) -> int:
         return 0
 
 
-def parse_schedule_datetime(date_s: str, time_s: str, offset_hours: float = 0.0) -> datetime:
-    """Parse user date/time (with optional ms) and apply offset_hours to reach UTC."""
+def parse_schedule_datetime(
+    date_s: str,
+    time_s: str,
+    offset_hours: float = 0.0,
+    tz_name: str = "IST",
+) -> datetime:
+    """Parse user date/time in IST (default) and convert to UTC for execution."""
     date_s = str(date_s or "").strip()
     time_s = str(time_s or "").strip()
     if not date_s or not time_s:
         raise ValueError("date and time required")
 
     d = None
-    for fmt in ("%m.%d.%Y", "%d.%m.%Y", "%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y"):
+    for fmt in ("%Y-%m-%d", "%m.%d.%Y", "%d.%m.%Y", "%m/%d/%Y", "%d/%m/%Y"):
         try:
             d = datetime.strptime(date_s, fmt).date()
             break
@@ -2445,8 +2451,11 @@ def parse_schedule_datetime(date_s: str, time_s: str, offset_hours: float = 0.0)
     if d is None:
         raise ValueError(f"invalid date format: {date_s}")
 
+    if len(time_s) == 5 and time_s.count(":") == 1:
+        time_s = f"{time_s}:00"
+
     t = None
-    for tfmt in ("%H:%M:%S.%f", "%H:%M:%S"):
+    for tfmt in ("%H:%M:%S.%f", "%H:%M:%S", "%H:%M"):
         try:
             t = datetime.strptime(time_s, tfmt).time()
             break
@@ -2455,8 +2464,21 @@ def parse_schedule_datetime(date_s: str, time_s: str, offset_hours: float = 0.0)
     if t is None:
         raise ValueError(f"invalid time format: {time_s}")
 
-    base = datetime.combine(d, t).replace(tzinfo=timezone.utc)
-    return base + timedelta(hours=float(offset_hours))
+    tz_key = (tz_name or "IST").strip().upper()
+    if tz_key in ("IST", "ASIA/KOLKATA", "IN", "INDIA"):
+        local_tz = ZoneInfo("Asia/Kolkata")
+    else:
+        local_tz = timezone.utc
+
+    local_dt = datetime.combine(d, t).replace(tzinfo=local_tz)
+    if offset_hours:
+        local_dt = local_dt + timedelta(hours=float(offset_hours))
+    return local_dt.astimezone(timezone.utc)
+
+
+def format_schedule_ist(dt_utc: datetime) -> str:
+    ist = dt_utc.astimezone(ZoneInfo("Asia/Kolkata"))
+    return ist.strftime("%d.%m.%Y %H:%M:%S IST")
 
 
 def _execute_place_grid(data: dict[str, Any]) -> dict[str, Any]:
@@ -2506,14 +2528,14 @@ def format_schedule_created_telegram(schedule: dict[str, Any]) -> str:
     kind = schedule.get("kind", "?").upper()
     payload = schedule.get("payload") or {}
     sym = _html_escape(str(payload.get("symbol", "?")))
-    when = _html_escape(str(schedule.get("execute_at", "?")).replace("T", " ").replace("+00:00", " UTC"))
     timeout = schedule.get("timeout_mmss") or "00:00"
+    when_ist = _html_escape(str(schedule.get("execute_at_ist") or schedule.get("date_input", "")))
+    when_utc = _html_escape(str(schedule.get("execute_at", "?")).replace("T", " ").replace("+00:00", " UTC"))
     return (
         f"<b>📅 Scheduled {kind} created</b>\n\n"
         f"<b>Symbol:</b> {sym}\n"
-        f"<b>Execute (UTC):</b> {when}\n"
-        f"<b>Input:</b> {schedule.get('date_input')} {schedule.get('time_input')}\n"
-        f"<b>Offset:</b> {schedule.get('offset_hours')}h\n"
+        f"<b>Execute (IST):</b> {when_ist}\n"
+        f"<b>Execute (UTC):</b> {when_utc}\n"
         f"<b>Timeout:</b> {timeout}\n"
         f"<b>ID:</b> <code>{schedule.get('id', '')[:8]}</code>"
     )
@@ -2641,29 +2663,35 @@ class ScheduleManager:
         kind: str,
         date_input: str,
         time_input: str,
-        offset_hours: float,
         timeout_mmss: str,
         payload: dict[str, Any],
+        offset_hours: float = 0.0,
+        tz_name: str = "IST",
     ) -> dict[str, Any]:
         if not TELEGRAM_BOT_TOKEN.strip():
             pass  # still allow schedule without telegram
 
         try:
-            execute_at = parse_schedule_datetime(date_input, time_input, offset_hours)
+            execute_at = parse_schedule_datetime(
+                date_input, time_input, offset_hours=offset_hours, tz_name=tz_name,
+            )
         except ValueError as exc:
             return {"ok": False, "error": str(exc)}
 
         now = datetime.now(timezone.utc)
         if execute_at <= now:
-            return {"ok": False, "error": "execute time must be in the future (UTC)"}
+            return {"ok": False, "error": "execute time must be in the future (IST)"}
 
         timeout_seconds = parse_timeout_mmss(timeout_mmss)
         schedule_id = str(uuid.uuid4())
+        execute_at_ist = format_schedule_ist(execute_at)
         schedule = {
             "id": schedule_id,
             "kind": kind,
             "status": "pending",
+            "timezone": (tz_name or "IST").upper(),
             "execute_at": execute_at.isoformat().replace("+00:00", "Z"),
+            "execute_at_ist": execute_at_ist,
             "execute_at_ms": int(execute_at.timestamp() * 1000),
             "date_input": date_input,
             "time_input": time_input,
@@ -4275,7 +4303,7 @@ def schedule_grid():
     data = json_body()
     if not data.get("symbol"):
         return jsonify({"ok": False, "error": "symbol required"}), 400
-    payload = {k: v for k, v in data.items() if k not in ("date", "time", "offset_hours", "timeout_mmss")}
+    payload = {k: v for k, v in data.items() if k not in ("date", "time", "offset_hours", "timeout_mmss", "timezone")}
     result = schedule_mgr.create(
         kind="grid",
         date_input=str(data.get("date", "")),
@@ -4283,6 +4311,7 @@ def schedule_grid():
         offset_hours=float(data.get("offset_hours", 0)),
         timeout_mmss=str(data.get("timeout_mmss", "00:00")),
         payload=payload,
+        tz_name=str(data.get("timezone", "IST")),
     )
     return jsonify(result), (200 if result.get("ok") else 400)
 
@@ -4299,7 +4328,7 @@ def schedule_trade():
         return jsonify({"ok": False, "error": "symbol required"}), 400
     if not data.get("type"):
         return jsonify({"ok": False, "error": "type required (buy/sell)"}), 400
-    payload = {k: v for k, v in data.items() if k not in ("date", "time", "offset_hours", "timeout_mmss")}
+    payload = {k: v for k, v in data.items() if k not in ("date", "time", "offset_hours", "timeout_mmss", "timezone")}
     payload["comment"] = payload.get("comment") or "scheduled-trade"
     result = schedule_mgr.create(
         kind="trade",
@@ -4308,6 +4337,7 @@ def schedule_trade():
         offset_hours=float(data.get("offset_hours", 0)),
         timeout_mmss=str(data.get("timeout_mmss", "00:00")),
         payload=payload,
+        tz_name=str(data.get("timezone", "IST")),
     )
     return jsonify(result), (200 if result.get("ok") else 400)
 
