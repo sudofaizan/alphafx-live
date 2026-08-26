@@ -66,6 +66,11 @@ from functools import wraps
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
+try:
+    import tzdata  # noqa: F401 — Windows needs this package for ZoneInfo
+except ImportError:
+    pass
+
 import certifi
 import MetaTrader5 as mt5
 from flask import Flask, jsonify, request
@@ -74,7 +79,7 @@ from flask import Flask, jsonify, request
 # Config
 # ---------------------------------------------------------------------------
 API_KEY = "alphafx"
-API_VERSION = "1.8.0"
+API_VERSION = "1.8.1"
 MT5_PATH = os.environ.get("MT5_TERMINAL_PATH", "")
 HOST = "0.0.0.0"
 PORT = 8080
@@ -2429,6 +2434,14 @@ def parse_timeout_mmss(value: str | None) -> int:
         return 0
 
 
+def get_ist_timezone():
+    """IST tz — ZoneInfo on Linux; fixed UTC+5:30 fallback on Windows without tzdata."""
+    try:
+        return ZoneInfo("Asia/Kolkata")
+    except Exception:
+        return timezone(timedelta(hours=5, minutes=30))
+
+
 def parse_schedule_datetime(
     date_s: str,
     time_s: str,
@@ -2466,7 +2479,7 @@ def parse_schedule_datetime(
 
     tz_key = (tz_name or "IST").strip().upper()
     if tz_key in ("IST", "ASIA/KOLKATA", "IN", "INDIA"):
-        local_tz = ZoneInfo("Asia/Kolkata")
+        local_tz = get_ist_timezone()
     else:
         local_tz = timezone.utc
 
@@ -2477,7 +2490,7 @@ def parse_schedule_datetime(
 
 
 def format_schedule_ist(dt_utc: datetime) -> str:
-    ist = dt_utc.astimezone(ZoneInfo("Asia/Kolkata"))
+    ist = dt_utc.astimezone(get_ist_timezone())
     return ist.strftime("%d.%m.%Y %H:%M:%S IST")
 
 
@@ -2711,7 +2724,10 @@ class ScheduleManager:
         self._save_state()
         self._ensure_thread()
 
-        tg = send_telegram_message(format_schedule_created_telegram(schedule))
+        try:
+            tg = send_telegram_message(format_schedule_created_telegram(schedule))
+        except Exception as exc:
+            tg = {"ok": False, "error": str(exc)}
         if not tg.get("ok"):
             schedule["telegram_warning"] = tg.get("error")
 
@@ -4297,49 +4313,57 @@ def place_grid():
 @require_api_key
 def schedule_grid():
     """
-    Schedule grid deploy at precise UTC time (ms).
-    Body: date, time, offset_hours, timeout_mmss, plus placeGrid params.
+    Schedule grid deploy at IST time (converted to UTC internally).
+    Body: date, time, timezone, timeout_mmss, plus placeGrid params.
     """
-    data = json_body()
-    if not data.get("symbol"):
-        return jsonify({"ok": False, "error": "symbol required"}), 400
-    payload = {k: v for k, v in data.items() if k not in ("date", "time", "offset_hours", "timeout_mmss", "timezone")}
-    result = schedule_mgr.create(
-        kind="grid",
-        date_input=str(data.get("date", "")),
-        time_input=str(data.get("time", "")),
-        offset_hours=float(data.get("offset_hours", 0)),
-        timeout_mmss=str(data.get("timeout_mmss", "00:00")),
-        payload=payload,
-        tz_name=str(data.get("timezone", "IST")),
-    )
-    return jsonify(result), (200 if result.get("ok") else 400)
+    try:
+        data = json_body()
+        if not data.get("symbol"):
+            return jsonify({"ok": False, "error": "symbol required"}), 400
+        payload = {k: v for k, v in data.items() if k not in ("date", "time", "offset_hours", "timeout_mmss", "timezone")}
+        result = schedule_mgr.create(
+            kind="grid",
+            date_input=str(data.get("date", "")),
+            time_input=str(data.get("time", "")),
+            timeout_mmss=str(data.get("timeout_mmss", "00:00")),
+            payload=payload,
+            offset_hours=float(data.get("offset_hours", 0) or 0),
+            tz_name=str(data.get("timezone", "IST")),
+        )
+        return jsonify(result), (200 if result.get("ok") else 400)
+    except Exception as exc:
+        print(f"[Schedule] grid error: {exc}")
+        return jsonify({"ok": False, "error": str(exc)}), 500
 
 
 @app.route("/schedule/trade", methods=["POST"])
 @require_api_key
 def schedule_trade():
     """
-    Schedule market trade at precise UTC time (ms).
-    Body: date, time, offset_hours, timeout_mmss, symbol, type, volume, sl_points, tp_points, magic
+    Schedule market trade at IST time (converted to UTC internally).
+    Body: date, time, timezone, timeout_mmss, symbol, type, volume, sl_points, tp_points, magic
     """
-    data = json_body()
-    if not data.get("symbol"):
-        return jsonify({"ok": False, "error": "symbol required"}), 400
-    if not data.get("type"):
-        return jsonify({"ok": False, "error": "type required (buy/sell)"}), 400
-    payload = {k: v for k, v in data.items() if k not in ("date", "time", "offset_hours", "timeout_mmss", "timezone")}
-    payload["comment"] = payload.get("comment") or "scheduled-trade"
-    result = schedule_mgr.create(
-        kind="trade",
-        date_input=str(data.get("date", "")),
-        time_input=str(data.get("time", "")),
-        offset_hours=float(data.get("offset_hours", 0)),
-        timeout_mmss=str(data.get("timeout_mmss", "00:00")),
-        payload=payload,
-        tz_name=str(data.get("timezone", "IST")),
-    )
-    return jsonify(result), (200 if result.get("ok") else 400)
+    try:
+        data = json_body()
+        if not data.get("symbol"):
+            return jsonify({"ok": False, "error": "symbol required"}), 400
+        if not data.get("type"):
+            return jsonify({"ok": False, "error": "type required (buy/sell)"}), 400
+        payload = {k: v for k, v in data.items() if k not in ("date", "time", "offset_hours", "timeout_mmss", "timezone")}
+        payload["comment"] = payload.get("comment") or "scheduled-trade"
+        result = schedule_mgr.create(
+            kind="trade",
+            date_input=str(data.get("date", "")),
+            time_input=str(data.get("time", "")),
+            timeout_mmss=str(data.get("timeout_mmss", "00:00")),
+            payload=payload,
+            offset_hours=float(data.get("offset_hours", 0) or 0),
+            tz_name=str(data.get("timezone", "IST")),
+        )
+        return jsonify(result), (200 if result.get("ok") else 400)
+    except Exception as exc:
+        print(f"[Schedule] trade error: {exc}")
+        return jsonify({"ok": False, "error": str(exc)}), 500
 
 
 @app.route("/schedule/status", methods=["GET"])
