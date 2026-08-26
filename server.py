@@ -16,6 +16,10 @@ Endpoints:
   GET  /newsAlerts/status
   POST /newsAlerts/start
   POST /newsAlerts/stop
+  POST /schedule/grid
+  POST /schedule/trade
+  GET  /schedule/status
+  POST /schedule/cancel
   GET  /suggestionWatch/status
   POST /suggestionWatch/stop
   GET  /telegramAlerts/status
@@ -55,6 +59,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from functools import wraps
@@ -68,7 +73,7 @@ from flask import Flask, jsonify, request
 # Config
 # ---------------------------------------------------------------------------
 API_KEY = "alphafx"
-API_VERSION = "1.7.9"
+API_VERSION = "1.8.0"
 MT5_PATH = os.environ.get("MT5_TERMINAL_PATH", "")
 HOST = "0.0.0.0"
 PORT = 8080
@@ -99,6 +104,12 @@ NEWS_ALERT_STATE_FILE = os.environ.get(
 )
 NEWS_ALERT_POLL_MS = int(os.environ.get("NEWS_ALERT_POLL_MS", "30000"))
 NEWS_ALERT_MINUTES_BEFORE = int(os.environ.get("NEWS_ALERT_MINUTES_BEFORE", "5"))
+SCHEDULE_STATE_FILE = os.environ.get(
+    "SCHEDULE_STATE_FILE",
+    os.path.join(SCRIPT_DIR, "schedule_state.json"),
+)
+SCHEDULE_POLL_MS_IDLE = int(os.environ.get("SCHEDULE_POLL_MS_IDLE", "500"))
+SCHEDULE_POLL_MS_HOT = int(os.environ.get("SCHEDULE_POLL_MS_HOT", "10"))
 
 TIMEFRAMES = {
     "M1": mt5.TIMEFRAME_M1,
@@ -2398,6 +2409,411 @@ class NewsAlertManager:
 news_alerts = NewsAlertManager()
 
 
+def parse_timeout_mmss(value: str | None) -> int:
+    """Parse MM:SS timeout; 00:00 or empty = no timeout."""
+    s = str(value or "").strip()
+    if not s or s in ("0", "00:00"):
+        return 0
+    if ":" in s:
+        parts = s.split(":", 1)
+        try:
+            mm = int(parts[0])
+            ss = int(parts[1]) if len(parts) > 1 else 0
+            return max(0, mm * 60 + ss)
+        except ValueError:
+            return 0
+    try:
+        return max(0, int(s))
+    except ValueError:
+        return 0
+
+
+def parse_schedule_datetime(date_s: str, time_s: str, offset_hours: float = 0.0) -> datetime:
+    """Parse user date/time (with optional ms) and apply offset_hours to reach UTC."""
+    date_s = str(date_s or "").strip()
+    time_s = str(time_s or "").strip()
+    if not date_s or not time_s:
+        raise ValueError("date and time required")
+
+    d = None
+    for fmt in ("%m.%d.%Y", "%d.%m.%Y", "%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y"):
+        try:
+            d = datetime.strptime(date_s, fmt).date()
+            break
+        except ValueError:
+            continue
+    if d is None:
+        raise ValueError(f"invalid date format: {date_s}")
+
+    t = None
+    for tfmt in ("%H:%M:%S.%f", "%H:%M:%S"):
+        try:
+            t = datetime.strptime(time_s, tfmt).time()
+            break
+        except ValueError:
+            continue
+    if t is None:
+        raise ValueError(f"invalid time format: {time_s}")
+
+    base = datetime.combine(d, t).replace(tzinfo=timezone.utc)
+    return base + timedelta(hours=float(offset_hours))
+
+
+def _execute_place_grid(data: dict[str, Any]) -> dict[str, Any]:
+    symbol = data.get("symbol")
+    if not symbol:
+        return {"ok": False, "error": "symbol required"}
+
+    magic = int(data.get("magic", 78001))
+    max_profit = float(data.get("max_floating_profit") or data.get("floating_profit") or 0)
+    basket_tp = float(
+        data.get("basket_tp_profit") or data.get("basket_tp") or max_profit or 0
+    )
+    basket_sl = float(
+        data.get("basket_sl_loss") or data.get("basket_sl") or data.get("target_loss") or basket_tp or 0
+    )
+
+    result = place_grid_fast(
+        symbol=symbol,
+        lot=float(data.get("lot", 0.01)),
+        distance=int(data.get("distance", 100)),
+        initial_distance=int(data.get("initial_distance", 200)),
+        orders_quantity=int(data.get("orders_quantity", 50)),
+        incremental=bool(data.get("incremental", False)),
+        magic=magic,
+        anchor=float(data["anchor"]) if data.get("anchor") else None,
+    )
+
+    if result.get("ok") and max_profit > 0:
+        result["grid_guard"] = grid_guard.add(
+            symbol=result.get("symbol", symbol),
+            magic=magic,
+            max_floating_profit=max_profit,
+        )
+
+    if result.get("ok") and basket_tp > 0:
+        result["basket_tp"] = basket_tp_mgr.add(
+            symbol=result.get("symbol", symbol),
+            magic=magic,
+            target_profit=basket_tp,
+            target_loss=basket_sl if basket_sl > 0 else None,
+        )
+
+    return result
+
+
+def format_schedule_created_telegram(schedule: dict[str, Any]) -> str:
+    kind = schedule.get("kind", "?").upper()
+    payload = schedule.get("payload") or {}
+    sym = _html_escape(str(payload.get("symbol", "?")))
+    when = _html_escape(str(schedule.get("execute_at", "?")).replace("T", " ").replace("+00:00", " UTC"))
+    timeout = schedule.get("timeout_mmss") or "00:00"
+    return (
+        f"<b>📅 Scheduled {kind} created</b>\n\n"
+        f"<b>Symbol:</b> {sym}\n"
+        f"<b>Execute (UTC):</b> {when}\n"
+        f"<b>Input:</b> {schedule.get('date_input')} {schedule.get('time_input')}\n"
+        f"<b>Offset:</b> {schedule.get('offset_hours')}h\n"
+        f"<b>Timeout:</b> {timeout}\n"
+        f"<b>ID:</b> <code>{schedule.get('id', '')[:8]}</code>"
+    )
+
+
+def format_schedule_done_telegram(schedule: dict[str, Any], success: bool) -> str:
+    kind = schedule.get("kind", "?").upper()
+    payload = schedule.get("payload") or {}
+    sym = _html_escape(str(payload.get("symbol", "?")))
+    label = f"Scheduled {kind} placed" if success else f"Scheduled {kind} failed"
+    emoji = "✅" if success else "❌"
+    lines = [f"<b>{emoji} {label}</b>", "", f"<b>Symbol:</b> {sym}", f"<b>ID:</b> <code>{schedule.get('id', '')[:8]}</code>"]
+    if not success and schedule.get("error"):
+        lines.append(f"<b>Error:</b> {_html_escape(str(schedule['error']))}")
+    return "\n".join(lines)
+
+
+def format_schedule_expired_telegram(schedule: dict[str, Any], close_result: dict[str, Any]) -> str:
+    kind = schedule.get("kind", "?").upper()
+    payload = schedule.get("payload") or {}
+    sym = _html_escape(str(payload.get("symbol", "?")))
+    return (
+        f"<b>⏱ Scheduled {kind} timeout</b>\n\n"
+        f"<b>Symbol:</b> {sym}\n"
+        f"Closed {close_result.get('closed_positions', 0)} position(s), "
+        f"cancelled {close_result.get('cancelled_orders', 0)} order(s)\n"
+        f"<b>ID:</b> <code>{schedule.get('id', '')[:8]}</code>"
+    )
+
+
+class ScheduleManager:
+    """Millisecond-precision scheduled grid deploy and trade execution."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._schedules: list[dict[str, Any]] = []
+        self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
+        self._load_state()
+
+    def _load_state(self) -> None:
+        if not os.path.isfile(SCHEDULE_STATE_FILE):
+            return
+        try:
+            with open(SCHEDULE_STATE_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+            with self._lock:
+                self._schedules = list(data.get("schedules") or [])
+            print(f"[Schedule] loaded {len(self._schedules)} schedule(s)")
+            self._ensure_thread()
+        except Exception as exc:
+            print(f"[Schedule] load failed: {exc}")
+
+    def _save_state(self) -> None:
+        try:
+            with self._lock:
+                payload = {"version": 1, "schedules": list(self._schedules), "saved_at": datetime.utcnow().isoformat() + "Z"}
+            tmp = SCHEDULE_STATE_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+            os.replace(tmp, SCHEDULE_STATE_FILE)
+        except Exception as exc:
+            print(f"[Schedule] save failed: {exc}")
+
+    def _ensure_thread(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._loop, daemon=True, name="schedule-ms")
+        self._thread.start()
+
+    def _parse_execute_at(self, schedule: dict[str, Any]) -> datetime:
+        raw = schedule.get("execute_at", "")
+        return datetime.fromisoformat(str(raw).replace("Z", "+00:00")).astimezone(timezone.utc)
+
+    def _pending(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [s for s in self._schedules if s.get("status") == "pending"]
+
+    def _next_pending_at(self) -> datetime | None:
+        pending = self._pending()
+        if not pending:
+            return None
+        return min(self._parse_execute_at(s) for s in pending)
+
+    def _wait_tick(self) -> None:
+        nxt = self._next_pending_at()
+        if nxt is None:
+            time.sleep(SCHEDULE_POLL_MS_IDLE / 1000.0)
+            return
+        now = datetime.now(timezone.utc)
+        delta = (nxt - now).total_seconds()
+        if delta > 60:
+            time.sleep(SCHEDULE_POLL_MS_IDLE / 1000.0)
+        elif delta > 0.05:
+            time.sleep(min(max(delta - 0.02, 0.001), SCHEDULE_POLL_MS_HOT / 1000.0))
+        else:
+            while datetime.now(timezone.utc) < nxt:
+                pass
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self._tick()
+            except Exception as exc:
+                print(f"[Schedule] loop error: {exc}")
+            self._wait_tick()
+
+    def _get_by_id(self, schedule_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            for s in self._schedules:
+                if s.get("id") == schedule_id:
+                    return s
+        return None
+
+    def _update(self, schedule_id: str, **fields: Any) -> None:
+        with self._lock:
+            for s in self._schedules:
+                if s.get("id") == schedule_id:
+                    s.update(fields)
+                    break
+
+    def create(
+        self,
+        kind: str,
+        date_input: str,
+        time_input: str,
+        offset_hours: float,
+        timeout_mmss: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        if not TELEGRAM_BOT_TOKEN.strip():
+            pass  # still allow schedule without telegram
+
+        try:
+            execute_at = parse_schedule_datetime(date_input, time_input, offset_hours)
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+
+        now = datetime.now(timezone.utc)
+        if execute_at <= now:
+            return {"ok": False, "error": "execute time must be in the future (UTC)"}
+
+        timeout_seconds = parse_timeout_mmss(timeout_mmss)
+        schedule_id = str(uuid.uuid4())
+        schedule = {
+            "id": schedule_id,
+            "kind": kind,
+            "status": "pending",
+            "execute_at": execute_at.isoformat().replace("+00:00", "Z"),
+            "execute_at_ms": int(execute_at.timestamp() * 1000),
+            "date_input": date_input,
+            "time_input": time_input,
+            "offset_hours": float(offset_hours),
+            "timeout_mmss": timeout_mmss or "00:00",
+            "timeout_seconds": timeout_seconds,
+            "payload": payload,
+            "created_at": now.isoformat().replace("+00:00", "Z"),
+            "executed_at": None,
+            "expired_at": None,
+            "result": None,
+            "error": None,
+        }
+
+        with self._lock:
+            self._schedules.append(schedule)
+        self._save_state()
+        self._ensure_thread()
+
+        tg = send_telegram_message(format_schedule_created_telegram(schedule))
+        if not tg.get("ok"):
+            schedule["telegram_warning"] = tg.get("error")
+
+        return {"ok": True, "schedule": schedule, "telegram": tg}
+
+    def cancel(self, schedule_id: str) -> dict[str, Any]:
+        sched = self._get_by_id(schedule_id)
+        if not sched:
+            return {"ok": False, "error": "schedule not found"}
+        if sched.get("status") != "pending":
+            return {"ok": False, "error": f"cannot cancel status={sched.get('status')}"}
+        self._update(schedule_id, status="cancelled", error="cancelled by user")
+        self._save_state()
+        return {"ok": True, "id": schedule_id, "status": "cancelled"}
+
+    def status(self) -> dict[str, Any]:
+        with self._lock:
+            rows = [dict(s) for s in self._schedules]
+        pending = [s for s in rows if s.get("status") == "pending"]
+        return {
+            "ok": True,
+            "count": len(rows),
+            "pending_count": len(pending),
+            "has_pending": len(pending) > 0,
+            "schedules": sorted(rows, key=lambda s: s.get("execute_at", ""), reverse=True),
+        }
+
+    def _run_timeout_close(self, schedule: dict[str, Any]) -> None:
+        timeout = int(schedule.get("timeout_seconds") or 0)
+        if timeout <= 0:
+            return
+        time.sleep(timeout)
+        sched = self._get_by_id(schedule["id"])
+        if not sched or sched.get("status") not in ("executed", "expired"):
+            return
+        payload = sched.get("payload") or {}
+        symbol = payload.get("symbol")
+        magic = int(payload.get("magic", DEFAULT_MAGIC))
+        ok, msg = ensure_mt5(MT5_PATH or None)
+        if not ok:
+            self._update(schedule["id"], error=f"timeout close: mt5 offline ({msg})")
+            self._save_state()
+            return
+        _, sym = resolve_symbol(str(symbol))
+        if not sym:
+            self._update(schedule["id"], error="timeout close: symbol not found")
+            self._save_state()
+            return
+        close_result = close_basket(sym, magic, comment=f"Schedule timeout {schedule['id'][:8]}")
+        self._update(
+            schedule["id"],
+            status="expired",
+            expired_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            timeout_result=close_result,
+        )
+        self._save_state()
+        send_telegram_message(format_schedule_expired_telegram(sched, close_result))
+        print(f"[Schedule] timeout close {sched.get('kind')} {sym} magic={magic}")
+
+    def _execute_schedule(self, schedule: dict[str, Any]) -> None:
+        schedule_id = schedule["id"]
+
+        ok_mt5, msg = ensure_mt5(MT5_PATH or None)
+        if not ok_mt5:
+            self._update(schedule_id, status="failed", error=f"mt5 not connected: {msg}")
+            self._save_state()
+            send_telegram_message(format_schedule_done_telegram(self._get_by_id(schedule_id) or schedule, False))
+            return
+
+        payload = dict(schedule.get("payload") or {})
+        kind = schedule.get("kind")
+        result: dict[str, Any]
+        try:
+            if kind == "grid":
+                result = _execute_place_grid(payload)
+            elif kind == "trade":
+                result, status_code = _execute_place_order(payload)
+                if status_code != 200:
+                    result = {"ok": False, **result}
+            else:
+                result = {"ok": False, "error": f"unknown kind: {kind}"}
+        except Exception as exc:
+            result = {"ok": False, "error": str(exc)}
+
+        success = bool(result.get("ok"))
+        self._update(
+            schedule_id,
+            status="executed" if success else "failed",
+            executed_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            result=result,
+            error=None if success else str(result.get("error") or "execution failed"),
+        )
+        self._save_state()
+
+        done_sched = self._get_by_id(schedule_id) or schedule
+        send_telegram_message(format_schedule_done_telegram(done_sched, success))
+        print(f"[Schedule] executed {kind} {schedule_id[:8]} ok={success}")
+
+        if success and int(schedule.get("timeout_seconds") or 0) > 0:
+            threading.Thread(
+                target=self._run_timeout_close,
+                args=(done_sched,),
+                daemon=True,
+                name=f"schedule-timeout-{schedule_id[:8]}",
+            ).start()
+
+    def _tick(self) -> None:
+        now = datetime.now(timezone.utc)
+        due: list[dict[str, Any]] = []
+        with self._lock:
+            for s in self._schedules:
+                if s.get("status") != "pending":
+                    continue
+                if self._parse_execute_at(s) <= now:
+                    s["status"] = "running"
+                    due.append(dict(s))
+        if due:
+            self._save_state()
+        for s in due:
+            threading.Thread(
+                target=self._execute_schedule,
+                args=(s,),
+                daemon=True,
+                name=f"schedule-exec-{s['id'][:8]}",
+            ).start()
+
+
+schedule_mgr = ScheduleManager()
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -2416,6 +2832,7 @@ def health():
         "suggestion_watch_jobs": len(suggestion_watch.status()),
         "telegram_alerts_active": telegram_alerts.status().get("active", False),
         "news_alerts_active": news_alerts.status().get("active", False),
+        "schedule_pending": schedule_mgr.status().get("pending_count", 0),
     })
 
 
@@ -3844,47 +4261,71 @@ def trail_status():
 @require_api_key
 @require_mt5
 def place_grid():
+    result = _execute_place_grid(json_body())
+    return jsonify(result), (200 if result.get("ok") else 400)
+
+
+@app.route("/schedule/grid", methods=["POST"])
+@require_api_key
+def schedule_grid():
+    """
+    Schedule grid deploy at precise UTC time (ms).
+    Body: date, time, offset_hours, timeout_mmss, plus placeGrid params.
+    """
     data = json_body()
-    symbol = data.get("symbol")
-    if not symbol:
+    if not data.get("symbol"):
         return jsonify({"ok": False, "error": "symbol required"}), 400
-
-    magic = int(data.get("magic", 78001))
-    max_profit = float(data.get("max_floating_profit") or data.get("floating_profit") or 0)
-    basket_tp = float(
-        data.get("basket_tp_profit") or data.get("basket_tp") or max_profit or 0
+    payload = {k: v for k, v in data.items() if k not in ("date", "time", "offset_hours", "timeout_mmss")}
+    result = schedule_mgr.create(
+        kind="grid",
+        date_input=str(data.get("date", "")),
+        time_input=str(data.get("time", "")),
+        offset_hours=float(data.get("offset_hours", 0)),
+        timeout_mmss=str(data.get("timeout_mmss", "00:00")),
+        payload=payload,
     )
-    basket_sl = float(
-        data.get("basket_sl_loss") or data.get("basket_sl") or data.get("target_loss") or basket_tp or 0
+    return jsonify(result), (200 if result.get("ok") else 400)
+
+
+@app.route("/schedule/trade", methods=["POST"])
+@require_api_key
+def schedule_trade():
+    """
+    Schedule market trade at precise UTC time (ms).
+    Body: date, time, offset_hours, timeout_mmss, symbol, type, volume, sl_points, tp_points, magic
+    """
+    data = json_body()
+    if not data.get("symbol"):
+        return jsonify({"ok": False, "error": "symbol required"}), 400
+    if not data.get("type"):
+        return jsonify({"ok": False, "error": "type required (buy/sell)"}), 400
+    payload = {k: v for k, v in data.items() if k not in ("date", "time", "offset_hours", "timeout_mmss")}
+    payload["comment"] = payload.get("comment") or "scheduled-trade"
+    result = schedule_mgr.create(
+        kind="trade",
+        date_input=str(data.get("date", "")),
+        time_input=str(data.get("time", "")),
+        offset_hours=float(data.get("offset_hours", 0)),
+        timeout_mmss=str(data.get("timeout_mmss", "00:00")),
+        payload=payload,
     )
+    return jsonify(result), (200 if result.get("ok") else 400)
 
-    result = place_grid_fast(
-        symbol=symbol,
-        lot=float(data.get("lot", 0.01)),
-        distance=int(data.get("distance", 100)),
-        initial_distance=int(data.get("initial_distance", 200)),
-        orders_quantity=int(data.get("orders_quantity", 50)),
-        incremental=bool(data.get("incremental", False)),
-        magic=magic,
-        anchor=float(data["anchor"]) if data.get("anchor") else None,
-    )
 
-    if result.get("ok") and max_profit > 0:
-        guard = grid_guard.add(
-            symbol=result.get("symbol", symbol),
-            magic=magic,
-            max_floating_profit=max_profit,
-        )
-        result["grid_guard"] = guard
+@app.route("/schedule/status", methods=["GET"])
+@require_api_key
+def schedule_status():
+    return jsonify(schedule_mgr.status())
 
-    if result.get("ok") and basket_tp > 0:
-        result["basket_tp"] = basket_tp_mgr.add(
-            symbol=result.get("symbol", symbol),
-            magic=magic,
-            target_profit=basket_tp,
-            target_loss=basket_sl if basket_sl > 0 else None,
-        )
 
+@app.route("/schedule/cancel", methods=["POST"])
+@require_api_key
+def schedule_cancel():
+    data = json_body()
+    schedule_id = str(data.get("id", "")).strip()
+    if not schedule_id:
+        return jsonify({"ok": False, "error": "id required"}), 400
+    result = schedule_mgr.cancel(schedule_id)
     return jsonify(result), (200 if result.get("ok") else 400)
 
 
@@ -4114,4 +4555,5 @@ if __name__ == "__main__":
     suggestion_watch.start()
     telegram_alerts._ensure_thread()
     news_alerts._ensure_thread()
+    schedule_mgr._ensure_thread()
     app.run(host=HOST, port=PORT, threaded=True)
