@@ -49,6 +49,10 @@ Endpoints:
   POST /telegramAlerts/stop
   POST /telegramAlerts/test
   GET  /telegramAlerts/status
+  GET  /autoTrade/status
+  POST /autoTrade/start    — M5+ candle-close OB signals → auto place (comment alphafxauto)
+  POST /autoTrade/stop
+  POST /autoTrade/config   — update lot/magic while running
 """
 from __future__ import annotations
 
@@ -79,7 +83,7 @@ from flask import Flask, jsonify, request
 # Config
 # ---------------------------------------------------------------------------
 API_KEY = "alphafx"
-API_VERSION = "1.8.1"
+API_VERSION = "1.8.2"
 MT5_PATH = os.environ.get("MT5_TERMINAL_PATH", "")
 HOST = "0.0.0.0"
 PORT = 8080
@@ -99,6 +103,15 @@ TELEGRAM_ALERT_STATE_FILE = os.environ.get(
 )
 TELEGRAM_ALERT_POLL_MS = int(os.environ.get("TELEGRAM_ALERT_POLL_MS", "5000"))
 TELEGRAM_ALERT_TIMEFRAMES = ["M1", "M5", "M15", "M30", "H1"]
+AUTOTRADE_TIMEFRAMES = ["M5", "M15", "M30", "H1"]
+AUTOTRADE_COMMENT = "alphafxauto"
+AUTOTRADE_STATE_FILE = os.environ.get(
+    "AUTOTRADE_STATE_FILE",
+    os.path.join(SCRIPT_DIR, "autotrade_state.json"),
+)
+AUTOTRADE_POLL_MS = int(os.environ.get("AUTOTRADE_POLL_MS", "5000"))
+AUTOTRADE_DEFAULT_LOT = float(os.environ.get("AUTOTRADE_DEFAULT_LOT", "0.01"))
+AUTOTRADE_DEFAULT_MAGIC = int(os.environ.get("AUTOTRADE_DEFAULT_MAGIC", "202611"))
 NEWS_CALENDAR_URL = os.environ.get(
     "NEWS_CALENDAR_URL",
     "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
@@ -2069,6 +2082,327 @@ class TelegramAlertManager:
 telegram_alerts = TelegramAlertManager()
 
 
+def has_autotrade_exposure(sym: str, magic: int) -> bool:
+    """True if an open position or pending order exists for this symbol with alphafxauto comment."""
+    for pos in mt5.positions_get(symbol=sym) or []:
+        if pos.magic == magic and AUTOTRADE_COMMENT in (pos.comment or ""):
+            return True
+    for order in mt5.orders_get(symbol=sym) or []:
+        if order.magic == magic and AUTOTRADE_COMMENT in (order.comment or ""):
+            return True
+    return False
+
+
+@dataclass
+class AutoTradeState:
+    active: bool = False
+    symbol: str = "XAUUSD"
+    bar_count: int = 200
+    lot_size: float = AUTOTRADE_DEFAULT_LOT
+    magic: int = AUTOTRADE_DEFAULT_MAGIC
+    timeframes: list[str] = field(default_factory=lambda: list(AUTOTRADE_TIMEFRAMES))
+    last_closed: dict[str, int] = field(default_factory=dict)
+    traded_blocks: list[str] = field(default_factory=list)
+    started_at: str = ""
+    stopped_at: str = ""
+    trades_placed: int = 0
+    last_check: str = ""
+    last_trade_at: str = ""
+    last_error: str = ""
+    last_order_ticket: int | None = None
+
+
+class AutoTradeManager:
+    """On M5+ candle close, auto-place OB suggestion orders (comment alphafxauto) with suggestion watch."""
+
+    def __init__(self, poll_ms: int = AUTOTRADE_POLL_MS):
+        self._state = AutoTradeState()
+        self._resolved_symbol = ""
+        self._lock = threading.Lock()
+        self._poll_ms = poll_ms
+        self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
+        self._load_state()
+
+    def _load_state(self) -> None:
+        if not os.path.isfile(AUTOTRADE_STATE_FILE):
+            return
+        try:
+            with open(AUTOTRADE_STATE_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+            fields = {f.name for f in AutoTradeState.__dataclass_fields__.values()}
+            self._state = AutoTradeState(**{k: v for k, v in data.items() if k in fields})
+            self._resolved_symbol = str(data.get("resolved_symbol") or "")
+            if self._state.active:
+                print("[AutoTrade] restored active monitoring from state file")
+                self.start(resume=True)
+        except Exception as exc:
+            print(f"[AutoTrade] state load failed: {exc}")
+
+    def _save_state(self) -> None:
+        try:
+            with self._lock:
+                payload = asdict(self._state)
+                payload["resolved_symbol"] = self._resolved_symbol
+                payload["version"] = 1
+                payload["saved_at"] = datetime.utcnow().isoformat() + "Z"
+            tmp = AUTOTRADE_STATE_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+            os.replace(tmp, AUTOTRADE_STATE_FILE)
+        except Exception as exc:
+            print(f"[AutoTrade] state save failed: {exc}")
+
+    def status(self) -> dict[str, Any]:
+        with self._lock:
+            st = asdict(self._state)
+        return {
+            "ok": True,
+            "active": st["active"],
+            "autotrading": "on" if st["active"] else "off",
+            "symbol": st["symbol"],
+            "resolved_symbol": self._resolved_symbol,
+            "bar_count": st["bar_count"],
+            "lot_size": st["lot_size"],
+            "magic": st["magic"],
+            "timeframes": st["timeframes"],
+            "comment": AUTOTRADE_COMMENT,
+            "trades_placed": st["trades_placed"],
+            "traded_blocks_count": len(st.get("traded_blocks") or []),
+            "started_at": st["started_at"],
+            "stopped_at": st["stopped_at"],
+            "last_check": st["last_check"],
+            "last_trade_at": st["last_trade_at"],
+            "last_error": st["last_error"],
+            "last_order_ticket": st.get("last_order_ticket"),
+            "state_file": AUTOTRADE_STATE_FILE,
+        }
+
+    def configure(
+        self,
+        lot_size: float | None = None,
+        magic: int | None = None,
+        bar_count: int | None = None,
+    ) -> dict[str, Any]:
+        if lot_size is not None:
+            lot = float(lot_size)
+            if lot <= 0:
+                return {"ok": False, "error": "lot_size must be > 0"}
+            self._state.lot_size = lot
+        if magic is not None:
+            self._state.magic = int(magic)
+        if bar_count is not None and int(bar_count) > 0:
+            self._state.bar_count = max(50, min(int(bar_count), 5000))
+        self._save_state()
+        return {
+            "ok": True,
+            "message": "Auto-trade settings updated",
+            **self.status(),
+        }
+
+    def start(
+        self,
+        symbol: str = "",
+        bar_count: int = 0,
+        lot_size: float = 0,
+        magic: int | None = None,
+        resume: bool = False,
+    ) -> dict[str, Any]:
+        if self._state.active and not resume:
+            return {
+                "ok": True,
+                "message": "Auto-trading already ON",
+                **self.status(),
+            }
+
+        ok, msg = ensure_mt5(MT5_PATH or None)
+        if not ok:
+            return {"ok": False, "error": "mt5 not connected", "detail": msg}
+
+        if symbol:
+            self._state.symbol = symbol.strip()
+        if bar_count > 0:
+            self._state.bar_count = max(50, min(int(bar_count), 5000))
+        if lot_size > 0:
+            self._state.lot_size = float(lot_size)
+        if magic is not None:
+            self._state.magic = int(magic)
+
+        info, sym = resolve_symbol(self._state.symbol)
+        if info is None:
+            return {"ok": False, "error": f"symbol not found: {self._state.symbol}"}
+        self._resolved_symbol = sym
+
+        self._sync_bar_times(sym, initialize=True)
+        self._state.active = True
+        self._state.started_at = datetime.utcnow().isoformat() + "Z"
+        self._state.stopped_at = ""
+        self._state.last_error = ""
+        self._save_state()
+        self._ensure_thread()
+
+        return {
+            "ok": True,
+            "message": "Auto-trading started (M5+ signals)",
+            "autotrading": "on",
+            **self.status(),
+        }
+
+    def stop(self) -> dict[str, Any]:
+        self._state.active = False
+        self._state.stopped_at = datetime.utcnow().isoformat() + "Z"
+        self._save_state()
+        return {
+            "ok": True,
+            "message": "Auto-trading stopped",
+            "autotrading": "off",
+            **self.status(),
+        }
+
+    def _ensure_thread(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._loop, daemon=True, name="autotrade")
+        self._thread.start()
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            if self._state.active:
+                self._tick()
+            time.sleep(self._poll_ms / 1000.0)
+
+    def _sync_bar_times(self, sym: str, initialize: bool = False) -> None:
+        for tf in self._state.timeframes:
+            mt5_tf = TIMEFRAMES.get(tf)
+            if mt5_tf is None:
+                continue
+            rates = mt5.copy_rates_from_pos(sym, mt5_tf, 0, 3)
+            if rates is None or len(rates) < 2:
+                continue
+            closed_time = int(rates[-2]["time"])
+            prev = self._state.last_closed.get(tf)
+            if initialize or prev is None:
+                self._state.last_closed[tf] = closed_time
+            elif closed_time != prev:
+                self._state.last_closed[tf] = closed_time
+                self._on_candle_close(sym, tf)
+
+    def _ob_trade_key(self, sym: str, ob: dict) -> str:
+        return "|".join([
+            sym,
+            str(ob.get("type", "")),
+            str(ob.get("time", "")),
+            str(ob.get("high", "")),
+            str(ob.get("low", "")),
+        ])
+
+    def _already_traded(self, key: str) -> bool:
+        return key in self._state.traded_blocks
+
+    def _mark_traded(self, key: str) -> None:
+        if key not in self._state.traded_blocks:
+            self._state.traded_blocks.append(key)
+        if len(self._state.traded_blocks) > 500:
+            self._state.traded_blocks = self._state.traded_blocks[-500:]
+
+    def _on_candle_close(self, sym: str, tf: str) -> None:
+        result = build_trade_suggestion(sym, tf, self._state.bar_count)
+        if not result.get("ok"):
+            self._state.last_error = result.get("error", "analysis failed")
+            return
+        if not result.get("has_setup"):
+            return
+        if result.get("risky"):
+            return
+
+        ob = result.get("ob") or {}
+        if not ob or not ob.get("is_tradeable", True):
+            return
+        if ob.get("status") in ("BROKEN", "MITIGATED", "STALE"):
+            return
+
+        key = self._ob_trade_key(sym, ob)
+        if self._already_traded(key):
+            return
+
+        if has_autotrade_exposure(sym, self._state.magic):
+            self._state.last_error = f"skip: existing {AUTOTRADE_COMMENT} exposure on {sym}"
+            return
+
+        order_type = str(result.get("order_type") or "").lower()
+        if not order_type:
+            return
+
+        order_data: dict[str, Any] = {
+            "symbol": self._state.symbol,
+            "type": order_type,
+            "volume": self._state.lot_size,
+            "sl": result.get("sl"),
+            "tp": result.get("tp"),
+            "magic": self._state.magic,
+            "comment": AUTOTRADE_COMMENT,
+            "watch": True,
+            "watch_meta": {
+                "chart_timeframe": tf,
+                "count": self._state.bar_count,
+                "ob_time": ob.get("time"),
+                "ob_type": ob.get("type"),
+                "ob": ob,
+            },
+        }
+        entry = result.get("entry")
+        if order_type not in ("buy", "sell") and entry is not None:
+            order_data["price"] = entry
+
+        payload, status = _execute_place_order(order_data)
+        if payload.get("ok"):
+            ticket = None
+            res = payload.get("result") or {}
+            if isinstance(res, dict):
+                ticket = res.get("order")
+            elif res is not None:
+                ticket = getattr(res, "order", None)
+            self._mark_traded(key)
+            self._state.trades_placed += 1
+            self._state.last_trade_at = datetime.utcnow().isoformat() + "Z"
+            self._state.last_order_ticket = int(ticket) if ticket else None
+            self._state.last_error = ""
+            print(
+                f"[AutoTrade] placed {sym} {tf} {result.get('side')} "
+                f"#{ticket} lot={self._state.lot_size}"
+            )
+            if TELEGRAM_BOT_TOKEN.strip():
+                tg_body = format_telegram_signal({**result, "symbol": sym, "chart_timeframe": tf})
+                send_telegram_message(
+                    tg_body + f"\n\n<b>🤖 AUTO PLACED</b> · #{ticket or '?'}"
+                    f" · {self._state.lot_size} lot · <code>{AUTOTRADE_COMMENT}</code>"
+                )
+        else:
+            err = payload.get("error") or str(payload.get("result") or "order failed")
+            self._state.last_error = str(err)
+            print(f"[AutoTrade] place failed: {self._state.last_error}")
+
+    def _tick(self) -> None:
+        self._state.last_check = datetime.utcnow().isoformat() + "Z"
+        sym = self._resolved_symbol
+        if not sym:
+            info, sym = resolve_symbol(self._state.symbol)
+            if info is None:
+                self._state.last_error = f"symbol not found: {self._state.symbol}"
+                self._save_state()
+                return
+            self._resolved_symbol = sym
+        try:
+            self._sync_bar_times(sym, initialize=False)
+        except Exception as exc:
+            self._state.last_error = str(exc)
+        self._save_state()
+
+
+auto_trade = AutoTradeManager()
+
+
 # ---------------------------------------------------------------------------
 # Auth / helpers
 # ---------------------------------------------------------------------------
@@ -2875,6 +3209,7 @@ def health():
         "trail_jobs": len(trail_mgr.status()),
         "suggestion_watch_jobs": len(suggestion_watch.status()),
         "telegram_alerts_active": telegram_alerts.status().get("active", False),
+        "autotrade_active": auto_trade.status().get("active", False),
         "news_alerts_active": news_alerts.status().get("active", False),
         "schedule_pending": schedule_mgr.status().get("pending_count", 0),
     })
@@ -4599,6 +4934,61 @@ def telegram_alerts_test():
     return jsonify(result), (200 if result.get("ok") else 400)
 
 
+@app.route("/autoTrade/status", methods=["GET"])
+@require_api_key
+def autotrade_status():
+    return jsonify(auto_trade.status())
+
+
+@app.route("/autoTrade/start", methods=["POST"])
+@require_api_key
+@require_mt5
+def autotrade_start():
+    """
+    Start M5+ auto-trading on candle-close OB signals.
+    Body: { "symbol": "XAUUSD", "bar_count": 200, "lot_size": 0.01, "magic": 202611 }
+    Orders use comment alphafxauto and suggestion watch for OB maintenance.
+    """
+    data = json_body()
+    symbol = str(data.get("symbol", "XAUUSD")).strip()
+    bar_count = int(data.get("bar_count", 200))
+    lot_size = float(data.get("lot_size") or data.get("volume") or AUTOTRADE_DEFAULT_LOT)
+    magic = data.get("magic")
+    result = auto_trade.start(
+        symbol=symbol,
+        bar_count=bar_count,
+        lot_size=lot_size,
+        magic=int(magic) if magic is not None else None,
+    )
+    return jsonify(result), (200 if result.get("ok") else 400)
+
+
+@app.route("/autoTrade/stop", methods=["POST"])
+@require_api_key
+def autotrade_stop():
+    """Stop auto-trading (does not close open positions or cancel pending orders)."""
+    result = auto_trade.stop()
+    return jsonify(result)
+
+
+@app.route("/autoTrade/config", methods=["POST"])
+@require_api_key
+def autotrade_config():
+    """Update lot size / magic while auto-trading is running."""
+    data = json_body()
+    lot_size = data.get("lot_size")
+    if lot_size is None:
+        lot_size = data.get("volume")
+    magic = data.get("magic")
+    bar_count = data.get("bar_count")
+    result = auto_trade.configure(
+        lot_size=float(lot_size) if lot_size is not None else None,
+        magic=int(magic) if magic is not None else None,
+        bar_count=int(bar_count) if bar_count is not None else None,
+    )
+    return jsonify(result), (200 if result.get("ok") else 400)
+
+
 if __name__ == "__main__":
     ok, msg = ensure_mt5(MT5_PATH or None)
     print(f"[MT5] {msg}")
@@ -4608,6 +4998,7 @@ if __name__ == "__main__":
     basket_tp_mgr.start()
     suggestion_watch.start()
     telegram_alerts._ensure_thread()
+    auto_trade._ensure_thread()
     news_alerts._ensure_thread()
     schedule_mgr._ensure_thread()
     app.run(host=HOST, port=PORT, threaded=True)
