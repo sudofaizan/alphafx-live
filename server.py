@@ -463,8 +463,22 @@ def place_grid_fast(
     incremental: bool = False,
     magic: int = 78001,
     anchor: float | None = None,
+    tp_points: int = 0,
+    sl_points: int = 0,
 ) -> dict[str, Any]:
-    """Fast grid — tight OrderSend loop (AlphaFX_XAU_GridTrigger_EA style)."""
+    """
+    Fast grid — pending buy/sell stops around hook (anchor).
+
+    Central TP (tp_points > 0):
+      All orders share the same take-profit *price* at hook ± tp_points.
+      Per-level TP distance = tp_points - offset_pts, where offset_pts is the
+      order's distance from hook (initial_distance + (level-1) * distance).
+      Buy stops → TP at hook + tp_points; sell stops → TP at hook - tp_points.
+
+    Per-order SL (sl_points > 0):
+      Each order gets the same SL distance from its own entry (not central).
+      sl_points == 0 → no SL on any order.
+    """
     info, sym = resolve_symbol(symbol)
     if info is None:
         return {"ok": False, "error": f"symbol not found: {symbol}"}
@@ -479,6 +493,9 @@ def place_grid_fast(
     if anchor is None:
         anchor = round_price(sym, (bid + ask) / 2.0)
 
+    central_tp = int(tp_points) if tp_points else 0
+    per_sl = int(sl_points) if sl_points else 0
+
     filling = supported_filling(sym)
     t0 = time.perf_counter()
     placed = failed = skipped = 0
@@ -488,17 +505,23 @@ def place_grid_fast(
         vol = lot * (2 ** (i - 1)) if incremental else lot
         vol = normalize_volume(sym, vol)
         offset_pts = initial_distance + (i - 1) * distance
+        level_tp_pts = max(0, central_tp - offset_pts) if central_tp > 0 else 0
 
         buy_price = round_price(sym, anchor + offset_pts * pt)
         if buy_price > ask + min_dist:
+            sl, tp = 0.0, 0.0
+            if per_sl > 0:
+                sl, _ = apply_points_to_prices(sym, "buy_stop", buy_price, per_sl, None)
+            if level_tp_pts > 0:
+                _, tp = apply_points_to_prices(sym, "buy_stop", buy_price, None, level_tp_pts)
             req = {
                 "action": mt5.TRADE_ACTION_PENDING,
                 "symbol": sym,
                 "volume": vol,
                 "type": mt5.ORDER_TYPE_BUY_STOP,
                 "price": buy_price,
-                "sl": 0.0,
-                "tp": 0.0,
+                "sl": sl,
+                "tp": tp,
                 "magic": magic,
                 "comment": f"GRID_B{i}",
                 "type_time": mt5.ORDER_TIME_GTC,
@@ -507,20 +530,36 @@ def place_grid_fast(
             ok, res = send_order(req)
             placed += int(ok)
             failed += int(not ok)
-            results.append({"side": "buy_stop", "level": i, "price": buy_price, "ok": ok, "order": getattr(res, "order", None)})
+            results.append({
+                "side": "buy_stop",
+                "level": i,
+                "price": buy_price,
+                "offset_pts": offset_pts,
+                "tp_points": level_tp_pts,
+                "sl_points": per_sl if per_sl > 0 else 0,
+                "tp": tp,
+                "sl": sl,
+                "ok": ok,
+                "order": getattr(res, "order", None),
+            })
         else:
             skipped += 1
 
         sell_price = round_price(sym, anchor - offset_pts * pt)
         if sell_price < bid - min_dist:
+            sl, tp = 0.0, 0.0
+            if per_sl > 0:
+                sl, _ = apply_points_to_prices(sym, "sell_stop", sell_price, per_sl, None)
+            if level_tp_pts > 0:
+                _, tp = apply_points_to_prices(sym, "sell_stop", sell_price, None, level_tp_pts)
             req = {
                 "action": mt5.TRADE_ACTION_PENDING,
                 "symbol": sym,
                 "volume": vol,
                 "type": mt5.ORDER_TYPE_SELL_STOP,
                 "price": sell_price,
-                "sl": 0.0,
-                "tp": 0.0,
+                "sl": sl,
+                "tp": tp,
                 "magic": magic,
                 "comment": f"GRID_S{i}",
                 "type_time": mt5.ORDER_TIME_GTC,
@@ -529,19 +568,40 @@ def place_grid_fast(
             ok, res = send_order(req)
             placed += int(ok)
             failed += int(not ok)
-            results.append({"side": "sell_stop", "level": i, "price": sell_price, "ok": ok, "order": getattr(res, "order", None)})
+            results.append({
+                "side": "sell_stop",
+                "level": i,
+                "price": sell_price,
+                "offset_pts": offset_pts,
+                "tp_points": level_tp_pts,
+                "sl_points": per_sl if per_sl > 0 else 0,
+                "tp": tp,
+                "sl": sl,
+                "ok": ok,
+                "order": getattr(res, "order", None),
+            })
         else:
             skipped += 1
+
+    buy_tp_price = round_price(sym, anchor + central_tp * pt) if central_tp > 0 else None
+    sell_tp_price = round_price(sym, anchor - central_tp * pt) if central_tp > 0 else None
 
     return {
         "ok": placed > 0,
         "symbol": sym,
         "anchor": anchor,
+        "hook_price": anchor,
+        "central_tp_points": central_tp,
+        "central_tp_price_buy_side": buy_tp_price,
+        "central_tp_price_sell_side": sell_tp_price,
+        "per_order_sl_points": per_sl,
         "placed": placed,
         "failed": failed,
         "skipped": skipped,
         "elapsed_ms": int((time.perf_counter() - t0) * 1000),
         "orders_quantity": orders_quantity,
+        "distance": distance,
+        "initial_distance": initial_distance,
         "magic": magic,
         "results": results,
     }
@@ -2851,6 +2911,8 @@ def _execute_place_grid(data: dict[str, Any]) -> dict[str, Any]:
         incremental=bool(data.get("incremental", False)),
         magic=magic,
         anchor=float(data["anchor"]) if data.get("anchor") else None,
+        tp_points=int(data.get("tp_points") or data.get("grid_tp_points") or data.get("central_tp_points") or 0),
+        sl_points=int(data.get("sl_points") or data.get("grid_sl_points") or data.get("per_order_sl_points") or 0),
     )
 
     if result.get("ok") and max_profit > 0:
