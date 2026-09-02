@@ -83,7 +83,7 @@ from flask import Flask, jsonify, request
 # Config
 # ---------------------------------------------------------------------------
 API_KEY = "alphafx"
-API_VERSION = "1.8.2"
+API_VERSION = "1.8.3"
 MT5_PATH = os.environ.get("MT5_TERMINAL_PATH", "")
 HOST = "0.0.0.0"
 PORT = 8080
@@ -3518,70 +3518,136 @@ def _bar_is_swing_high(bars: list[dict[str, Any]], i: int, left: int, right: int
     return True
 
 
+def _rsi_is_pivot_low(rsi_aligned: list[float | None], i: int, left: int, right: int) -> bool:
+    """ta.pivotlow(osc, left, right) on RSI series."""
+    ri = rsi_aligned[i]
+    if ri is None:
+        return False
+    for j in range(i - left, i + right + 1):
+        if j == i:
+            continue
+        rj = rsi_aligned[j]
+        if rj is None:
+            return False
+        if rj <= ri:
+            return False
+    return True
+
+
+def _rsi_is_pivot_high(rsi_aligned: list[float | None], i: int, left: int, right: int) -> bool:
+    """ta.pivothigh(osc, left, right) on RSI series."""
+    ri = rsi_aligned[i]
+    if ri is None:
+        return False
+    for j in range(i - left, i + right + 1):
+        if j == i:
+            continue
+        rj = rsi_aligned[j]
+        if rj is None:
+            return False
+        if rj >= ri:
+            return False
+    return True
+
+
 def find_rsi_divergences(
     bars: list[dict[str, Any]],
     rsi_aligned: list[float | None],
-    pivot_left: int = 3,
-    pivot_right: int = 3,
-    min_gap: int = 5,
-    max_results: int = 8,
+    *,
+    rsi_period: int = 14,
+    pivot_left: int = 5,
+    pivot_right: int = 5,
+    range_lower: int = 5,
+    range_upper: int = 60,
+    plot_bull: bool = True,
+    plot_hidden_bull: bool = False,
+    plot_bear: bool = True,
+    plot_hidden_bear: bool = False,
+    max_results: int = 12,
 ) -> list[dict[str, Any]]:
     """
-    TradingView-style RSI divergence:
-      Bullish — price lower low, RSI higher low (swing lows)
-      Bearish — price higher high, RSI lower high (swing highs)
+    TradingView RSI Divergence Indicator (v6) logic:
+      - Pivots on RSI (ta.pivotlow / ta.pivothigh), not price
+      - Regular bull: price lower low + RSI higher low
+      - Hidden bull: price higher low + RSI lower low
+      - Regular bear: price higher high + RSI lower high
+      - Hidden bear: price lower high + RSI higher high
+      - Pivot spacing: range_lower..range_upper bars between confirmations
     """
     divergences: list[dict[str, Any]] = []
-    piv_low: list[tuple[int, float, float]] = []
-    piv_high: list[tuple[int, float, float]] = []
-    period = 14
-    start = max(pivot_left, period)
+    lb_l, lb_r = pivot_left, pivot_right
+    piv_low: list[tuple[int, float, float, int]] = []   # center, low, rsi, confirm_k
+    piv_high: list[tuple[int, float, float, int]] = []  # center, high, rsi, confirm_k
+    start = max(lb_l, rsi_period)
 
     def point(idx: int, price: float, rsi_val: float) -> dict[str, Any]:
         t = datetime.utcfromtimestamp(bars[idx]["time"]).isoformat() + "Z"
-        return {
-            "time": t,
-            "price": round(price, 5),
-            "rsi": round(rsi_val, 2),
-        }
+        return {"time": t, "price": round(price, 5), "rsi": round(rsi_val, 2)}
 
-    for k in range(start + pivot_right, len(bars) - 1):
-        i = k - pivot_right
-        if i < pivot_left or i >= len(bars) - pivot_right:
+    def append_div(
+        direction: str,
+        kind: str,
+        label: str,
+        i1: int,
+        p1: float,
+        r1: float,
+        i2: int,
+        p2: float,
+        r2: float,
+        confirm_k: int,
+    ) -> None:
+        divergences.append({
+            "type": direction,
+            "kind": kind,
+            "label": label,
+            "signal_time": datetime.utcfromtimestamp(bars[confirm_k]["time"]).isoformat() + "Z",
+            "signal_index": confirm_k,
+            "pivot_index": i2,
+            "price": {"p1": point(i1, p1, r1), "p2": point(i2, p2, r2)},
+            "rsi": {"p1": point(i1, p1, r1), "p2": point(i2, p2, r2)},
+        })
+
+    for k in range(start + lb_r, len(bars) - 1):
+        i = k - lb_r
+        if i < lb_l or i >= len(bars) - lb_r:
             continue
         ri = rsi_aligned[i]
         if ri is None:
             continue
 
-        if _bar_is_swing_low(bars, i, pivot_left, pivot_right):
-            piv_low.append((i, float(bars[i]["low"]), float(ri)))
-            if len(piv_low) >= 2:
-                i1, l1, r1 = piv_low[-2]
-                i2, l2, r2 = piv_low[-1]
-                if i2 - i1 >= min_gap and l2 < l1 - 1e-9 and r2 > r1 + 1e-9:
-                    divergences.append({
-                        "type": "bullish",
-                        "label": "Bull",
-                        "signal_time": datetime.utcfromtimestamp(bars[k]["time"]).isoformat() + "Z",
-                        "signal_index": k,
-                        "price": {"p1": point(i1, l1, r1), "p2": point(i2, l2, r2)},
-                        "rsi": {"p1": point(i1, l1, r1), "p2": point(i2, l2, r2)},
-                    })
+        # RSI pivot low confirmed (plFound)
+        if _rsi_is_pivot_low(rsi_aligned, i, lb_l, lb_r):
+            osc_curr = float(ri)
+            price_low_curr = float(bars[i]["low"])
+            if piv_low:
+                i_prev, low_prev, osc_prev, k_prev = piv_low[-1]
+                bars_since = k - k_prev
+                in_range = range_lower <= bars_since <= range_upper
+                if in_range:
+                    # Regular bullish — price LL, osc HL
+                    if plot_bull and price_low_curr < low_prev and osc_curr > osc_prev:
+                        append_div("bullish", "regular", "Bull", i_prev, low_prev, osc_prev, i, price_low_curr, osc_curr, k)
+                    # Hidden bullish — price HL, osc LL
+                    if plot_hidden_bull and price_low_curr > low_prev and osc_curr < osc_prev:
+                        append_div("bullish", "hidden", "H Bull", i_prev, low_prev, osc_prev, i, price_low_curr, osc_curr, k)
+            piv_low.append((i, price_low_curr, osc_curr, k))
 
-        if _bar_is_swing_high(bars, i, pivot_left, pivot_right):
-            piv_high.append((i, float(bars[i]["high"]), float(ri)))
-            if len(piv_high) >= 2:
-                i1, h1, r1 = piv_high[-2]
-                i2, h2, r2 = piv_high[-1]
-                if i2 - i1 >= min_gap and h2 > h1 + 1e-9 and r2 < r1 - 1e-9:
-                    divergences.append({
-                        "type": "bearish",
-                        "label": "Bear",
-                        "signal_time": datetime.utcfromtimestamp(bars[k]["time"]).isoformat() + "Z",
-                        "signal_index": k,
-                        "price": {"p1": point(i1, h1, r1), "p2": point(i2, h2, r2)},
-                        "rsi": {"p1": point(i1, h1, r1), "p2": point(i2, h2, r2)},
-                    })
+        # RSI pivot high confirmed (phFound)
+        if _rsi_is_pivot_high(rsi_aligned, i, lb_l, lb_r):
+            osc_curr = float(ri)
+            price_high_curr = float(bars[i]["high"])
+            if piv_high:
+                i_prev, high_prev, osc_prev, k_prev = piv_high[-1]
+                bars_since = k - k_prev
+                in_range = range_lower <= bars_since <= range_upper
+                if in_range:
+                    # Regular bearish — price HH, osc LH
+                    if plot_bear and price_high_curr > high_prev and osc_curr < osc_prev:
+                        append_div("bearish", "regular", "Bear", i_prev, high_prev, osc_prev, i, price_high_curr, osc_curr, k)
+                    # Hidden bearish — price LH, osc HH
+                    if plot_hidden_bear and price_high_curr < high_prev and osc_curr > osc_prev:
+                        append_div("bearish", "hidden", "H Bear", i_prev, high_prev, osc_prev, i, price_high_curr, osc_curr, k)
+            piv_high.append((i, price_high_curr, osc_curr, k))
 
     divergences.sort(key=lambda d: d["signal_index"], reverse=True)
     return divergences[:max_results]
