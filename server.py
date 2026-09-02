@@ -83,7 +83,7 @@ from flask import Flask, jsonify, request
 # Config
 # ---------------------------------------------------------------------------
 API_KEY = "alphafx"
-API_VERSION = "1.8.4"
+API_VERSION = "1.8.6"
 MT5_PATH = os.environ.get("MT5_TERMINAL_PATH", "")
 HOST = "0.0.0.0"
 PORT = 8080
@@ -3702,6 +3702,499 @@ def _smc_ts(bars: list[dict[str, Any]], idx: int) -> str:
     return datetime.utcfromtimestamp(bars[idx]["time"]).isoformat() + "Z"
 
 
+def calc_atr_series(bars: list[dict[str, Any]], period: int = 200) -> list[float]:
+    n = len(bars)
+    if n < 2:
+        return [0.0] * max(n, 1)
+    trs: list[float] = []
+    for i in range(n):
+        if i == 0:
+            trs.append(bars[i]["high"] - bars[i]["low"])
+        else:
+            pc = bars[i - 1]["close"]
+            trs.append(max(
+                bars[i]["high"] - bars[i]["low"],
+                abs(bars[i]["high"] - pc),
+                abs(bars[i]["low"] - pc),
+            ))
+    atr = [0.0] * n
+    if n < period:
+        avg = sum(trs) / len(trs) if trs else 0.0
+        return [avg] * n
+    atr[period - 1] = sum(trs[:period]) / period
+    for i in range(period, n):
+        atr[i] = (atr[i - 1] * (period - 1) + trs[i]) / period
+    seed = atr[period - 1]
+    for i in range(period - 1):
+        atr[i] = seed
+    return atr
+
+
+def _infer_bar_period_seconds(bars: list[dict[str, Any]]) -> int:
+    if len(bars) < 3:
+        return 300
+    deltas = sorted(bars[i]["time"] - bars[i - 1]["time"] for i in range(1, min(30, len(bars))))
+    return max(60, int(deltas[len(deltas) // 2]))
+
+
+def _bb_timeframe_changed(bars: list[dict[str, Any]], k: int, period_sec: int) -> bool:
+    if k < 1:
+        return False
+    return (bars[k]["time"] // period_sec) != (bars[k - 1]["time"] // period_sec)
+
+
+def _bb_find_idx(
+    bars: list[dict[str, Any]],
+    k: int,
+    ms_loc: int,
+    *,
+    use_max: bool,
+    use_ob: bool = False,
+    sweep: bool = False,
+    xloc: int | None = None,
+) -> int:
+    anchor = xloc if sweep and xloc is not None else ms_loc
+    anchor = max(0, min(anchor, k))
+    hi = [b["high"] for b in bars]
+    lo = [b["low"] for b in bars]
+    if use_max:
+        best_idx = anchor
+        best_val = hi[anchor]
+        for bi in range(anchor + 1, k + 1):
+            if hi[bi] >= best_val:
+                best_val = hi[bi]
+                best_idx = bi
+        if use_ob and best_idx + 1 <= k and hi[best_idx + 1] > hi[best_idx]:
+            best_idx += 1
+        return best_idx
+    best_idx = anchor
+    best_val = lo[anchor]
+    for bi in range(anchor + 1, k + 1):
+        if lo[bi] <= best_val:
+            best_val = lo[bi]
+            best_idx = bi
+    if use_ob and best_idx + 1 <= k and lo[best_idx + 1] < lo[best_idx]:
+        best_idx += 1
+    return best_idx
+
+
+def _bb_ob_top_bottom(
+    bars: list[dict[str, Any]],
+    atr: list[float],
+    k: int,
+    ms_loc: int,
+    *,
+    ob_mode: str = "Length",
+    ob_len: int = 5,
+) -> tuple[float, float]:
+    id_bull = _bb_find_idx(bars, k, ms_loc, use_max=False, use_ob=True)
+    id_bear = _bb_find_idx(bars, k, ms_loc, use_max=True, use_ob=True)
+    scale = (atr[id_bull] / (5 / ob_len)) if ob_len else atr[id_bull]
+    scale_bear = (atr[id_bear] / (5 / ob_len)) if ob_len else atr[id_bear]
+    hi, lo = bars[id_bull]["high"], bars[id_bull]["low"]
+    hi_b, lo_b = bars[id_bear]["high"], bars[id_bear]["low"]
+    if ob_mode == "Length":
+        top_p = max(hi, lo + scale)
+        btm_p = min(lo_b, hi_b - scale_bear)
+    else:
+        top_p, btm_p = hi, lo_b
+    return top_p, btm_p
+
+
+def _bb_mitigate_fvg(box: dict[str, Any], bar: dict[str, Any], src: str = "Close") -> bool:
+    o, h, l, c = bar["open"], bar["high"], bar["low"], bar["close"]
+    top, btm = box["top"], box["bottom"]
+    mid = (top + btm) / 2
+    if box["type"] == "bullish":
+        if src == "Close":
+            return min(c, o) < btm
+        if src == "Wick":
+            return l < btm
+        return l < mid
+    if src == "Close":
+        return max(c, o) > top
+    if src == "Wick":
+        return h > top
+    return h > mid
+
+
+def _bb_overlap_fvg_remove(fvgs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if len(fvgs) < 2:
+        return fvgs
+    out = list(fvgs)
+    changed = True
+    while changed and len(out) > 1:
+        changed = False
+        for i in range(len(out) - 1, 0, -1):
+            a, b = out[i], out[0]
+            if a["bottom"] > b["bottom"] and a["bottom"] < b["top"]:
+                out.pop(i); changed = True
+            elif a["top"] < b["top"] and a["bottom"] > b["bottom"]:
+                out.pop(i); changed = True
+            elif a["top"] > b["top"] and a["bottom"] < b["bottom"]:
+                out.pop(i); changed = True
+            elif a["top"] < b["top"] and a["top"] > b["bottom"]:
+                out.pop(i); changed = True
+    return out
+
+
+def analyze_bigbeluga_smc(
+    bars: list[dict[str, Any]],
+    *,
+    mslen: int = 5,
+    swing_limit: int = 100,
+    ob_last: int = 5,
+    fvg_num: int = 5,
+    fvg_thresh: float = 0.0,
+    buildsweep: bool = True,
+    ob_mode: str = "Length",
+    ob_len: int = 5,
+    fvg_miti: str = "Close",
+    fvg_overlap: bool = True,
+) -> dict[str, Any]:
+    """
+    BigBeluga « Smart Money Concepts » — swing BOS/CHoCH, volumetric OBs, FVG.
+    Ported from TradingView Pine (© BigBeluga); merged alongside LudoGH68 SMC.
+    """
+    n = len(bars)
+    if n < mslen * 2 + 5:
+        return {
+            "source": "bigbeluga",
+            "trend": 0,
+            "fvgs": [],
+            "structures": [],
+            "order_blocks": [],
+            "fvg_count": 0,
+            "structure_count": 0,
+            "ob_count": 0,
+        }
+
+    atr = calc_atr_series(bars, 200)
+    period_sec = _infer_bar_period_seconds(bars)
+    highs = [b["high"] for b in bars]
+    lows = [b["low"] for b in bars]
+    opens = [b["open"] for b in bars]
+    closes = [b["close"] for b in bars]
+    vols = [int(b.get("volume") or 0) for b in bars]
+
+    # --- BigBeluga FVG ---
+    bl_fvg: list[dict[str, Any]] = []
+    br_fvg: list[dict[str, Any]] = []
+    pending_up = False
+    pending_dn = False
+
+    for k in range(n):
+        if k >= 4 and pending_up:
+            bl_fvg.insert(0, {
+                "type": "bullish",
+                "top": lows[k - 1],
+                "bottom": highs[k - 3],
+                "left_idx": k - 3,
+                "right_idx": k - 1,
+                "mitigated": False,
+                "is_breaker": False,
+            })
+        if k >= 4 and pending_dn:
+            br_fvg.insert(0, {
+                "type": "bearish",
+                "top": lows[k - 3],
+                "bottom": highs[k - 1],
+                "left_idx": k - 3,
+                "right_idx": k - 1,
+                "mitigated": False,
+                "is_breaker": False,
+            })
+
+        if k >= 3:
+            h2 = highs[k - 2]
+            l2 = lows[k - 2]
+            h1, l1 = highs[k - 1], lows[k - 1]
+            c1 = closes[k - 1]
+            cc = _bb_timeframe_changed(bars, k, period_sec)
+            bl_th = l1 + (atr[k - 1] * fvg_thresh)
+            br_th = h1 - (atr[k - 1] * fvg_thresh)
+            pending_up = lows[k] > h2 and cc and c1 > bl_th
+            pending_dn = l2 > highs[k] and cc and c1 < br_th
+
+        bar = bars[k]
+        still_bl: list[dict[str, Any]] = []
+        for box in bl_fvg:
+            box["right_idx"] = k
+            if not box["mitigated"] and _bb_mitigate_fvg(box, bar, fvg_miti):
+                box["mitigated"] = True
+                box["mitigate_idx"] = k
+            still_bl.append(box)
+        bl_fvg = still_bl
+        still_br: list[dict[str, Any]] = []
+        for box in br_fvg:
+            box["right_idx"] = k
+            if not box["mitigated"] and _bb_mitigate_fvg(box, bar, fvg_miti):
+                box["mitigated"] = True
+                box["mitigate_idx"] = k
+            still_br.append(box)
+        br_fvg = still_br
+
+    active_fvgs = (bl_fvg[:fvg_num] if fvg_num else []) + (br_fvg[:fvg_num] if fvg_num else [])
+    if fvg_overlap:
+        bulls = _bb_overlap_fvg_remove([f for f in active_fvgs if f["type"] == "bullish"])
+        bears = _bb_overlap_fvg_remove([f for f in active_fvgs if f["type"] == "bearish"])
+        active_fvgs = bulls + bears
+
+    fvgs_out: list[dict[str, Any]] = []
+    for box in active_fvgs:
+        li = max(0, min(box["left_idx"], n - 1))
+        ri = max(0, min(box.get("right_idx", n - 1), n - 1))
+        fvgs_out.append({
+            "source": "bigbeluga",
+            "type": box["type"],
+            "top": round(box["top"], 5),
+            "bottom": round(box["bottom"], 5),
+            "time_start": _smc_ts(bars, li),
+            "time_end": _smc_ts(bars, ri),
+            "mitigated": bool(box["mitigated"]),
+        })
+
+    # --- BigBeluga market structure + volumetric OBs ---
+    blob: list[dict[str, Any]] = []
+    brob: list[dict[str, Any]] = []
+    bldw: list[dict[str, Any]] = []
+    brdw: list[dict[str, Any]] = []
+    php: list[float] = []
+    phn: list[int] = []
+    plp: list[float] = []
+    pln: list[int] = []
+
+    ms = {
+        "start": 0,
+        "trend": 0,
+        "bos": None,
+        "choch": None,
+        "main": None,
+        "loc": 0,
+        "temp": 0,
+        "xloc": 0,
+    }
+    up_tr = highs[0]
+    dn_tr = lows[0]
+
+    def add_ob(bull: bool, cords: float, idx: int) -> None:
+        bar = bars[idx]
+        if bull:
+            blob.insert(0, {
+                "type": "bullish",
+                "top": cords,
+                "bottom": bar["low"],
+                "avg": (cords + bar["low"]) / 2,
+                "left_idx": idx,
+                "right_idx": n - 1,
+                "mitigated": False,
+                "volume": vols[idx],
+            })
+        else:
+            brob.insert(0, {
+                "type": "bearish",
+                "top": bar["high"],
+                "bottom": cords,
+                "avg": (bar["high"] + cords) / 2,
+                "left_idx": idx,
+                "right_idx": n - 1,
+                "mitigated": False,
+                "volume": vols[idx],
+            })
+
+    def add_line(target: list[dict[str, Any]], x1: int, x2: int, y: float, txt: str, kind: str, sweep: bool = False) -> None:
+        target.insert(0, {
+            "label": txt,
+            "kind": kind,
+            "level": round(y, 5),
+            "time_start": _smc_ts(bars, x1),
+            "time_end": _smc_ts(bars, x2),
+            "start_index": x1,
+            "end_index": x2,
+            "sweep": sweep,
+            "source": "bigbeluga",
+        })
+
+    for k in range(n):
+        piv_i = k - mslen
+        if piv_i >= mslen and piv_i < n - mslen:
+            window_h = highs[piv_i - mslen: piv_i + mslen + 1]
+            window_l = lows[piv_i - mslen: piv_i + mslen + 1]
+            if highs[piv_i] == max(window_h):
+                phn.insert(0, piv_i)
+                php.insert(0, highs[piv_i])
+            if lows[piv_i] == min(window_l):
+                pln.insert(0, piv_i)
+                plp.insert(0, lows[piv_i])
+
+        if php and highs[k] > php[0]:
+            php.clear()
+            phn.clear()
+        if plp and lows[k] < plp[0]:
+            plp.clear()
+            pln.clear()
+
+        cross_up = cross_dn = False
+        if highs[k] > up_tr:
+            up_tr, dn_tr = highs[k], lows[k]
+            cross_up = True
+        if lows[k] < dn_tr:
+            up_tr, dn_tr = highs[k], lows[k]
+            cross_dn = True
+
+        if ms["start"] == 0:
+            ms.update({
+                "start": 1,
+                "bos": highs[k],
+                "choch": lows[k],
+                "loc": k,
+                "temp": k,
+                "xloc": k,
+            })
+            add_line(bldw, k, k, highs[k], "CHoCH", "bullish")
+            add_line(brdw, k, k, lows[k], "CHoCH", "bearish")
+            continue
+
+        top_p, btm_p = _bb_ob_top_bottom(bars, atr, k, ms["loc"], ob_mode=ob_mode, ob_len=ob_len)
+        c, o = closes[k], opens[k]
+        c1, o1 = closes[k - 1], opens[k - 1]
+
+        if ms["start"] == 1:
+            if ms["choch"] is not None and c <= ms["choch"]:
+                id_bull = _bb_find_idx(bars, k, ms["loc"], use_max=False, use_ob=True)
+                add_ob(True, top_p, id_bull)
+                ms.update({"trend": -1, "start": 2, "choch": ms["bos"], "bos": None,
+                           "main": lows[k], "loc": k, "temp": k, "xloc": k})
+                if brdw:
+                    brdw[0]["end_index"] = k
+                    brdw[0]["time_end"] = _smc_ts(bars, k)
+            elif ms["bos"] is not None and c >= ms["bos"]:
+                id_bear = _bb_find_idx(bars, k, ms["loc"], use_max=True, use_ob=True)
+                add_ob(False, btm_p, id_bear)
+                ms.update({"trend": 1, "start": 2, "bos": None,
+                           "main": highs[k], "loc": k, "temp": k, "xloc": k})
+                if bldw:
+                    bldw[0]["end_index"] = k
+                    bldw[0]["time_end"] = _smc_ts(bars, k)
+            continue
+
+        if ms["start"] != 2:
+            continue
+
+        if ms["trend"] == -1:
+            if ms["main"] is None or lows[k] <= ms["main"]:
+                ms["main"] = lows[k]
+                ms["temp"] = k
+
+            if ms["bos"] is None and cross_up and c > o and c1 > o1:
+                ms["bos"] = ms["main"]
+                ms["loc"] = ms["temp"]
+                ms["xloc"] = ms["loc"]
+                add_line(brdw, ms["loc"], k, lows[ms["loc"]], "BOS", "bearish")
+
+            if ms["bos"] is not None and c <= ms["bos"]:
+                add_line(brdw, ms.get("loc", k), k, ms["bos"], "BOS", "bearish")
+                id_bear = _bb_find_idx(bars, k, ms["loc"], use_max=True, use_ob=False)
+                add_ob(False, btm_p, id_bear)
+                ms["bos"] = None
+                hi_idx = _bb_find_idx(bars, k, k, use_max=True, use_ob=False)
+                ms["choch"] = highs[hi_idx]
+                ms["loc"] = hi_idx
+                add_line(bldw, hi_idx, k, highs[hi_idx], "CHoCH", "bullish")
+
+            elif ms["choch"] is not None and c >= ms["choch"]:
+                add_line(bldw, ms.get("xloc", k), k, ms["choch"], "CHoCH", "bullish")
+                id_bull = _bb_find_idx(bars, k, ms["loc"], use_max=False, use_ob=False)
+                add_ob(True, top_p, id_bull)
+                ms.update({"trend": 1, "bos": None, "main": highs[k], "loc": k, "temp": k, "xloc": k})
+
+            if brdw:
+                brdw[0]["end_index"] = k
+                brdw[0]["time_end"] = _smc_ts(bars, k)
+            if bldw:
+                bldw[0]["end_index"] = k
+                bldw[0]["time_end"] = _smc_ts(bars, k)
+
+        elif ms["trend"] == 1:
+            if ms["main"] is None or highs[k] >= ms["main"]:
+                ms["main"] = highs[k]
+                ms["temp"] = k
+
+            if ms["bos"] is None and cross_dn and c < o and c1 < o1:
+                ms["bos"] = ms["main"]
+                ms["loc"] = ms["temp"]
+                ms["xloc"] = ms["loc"]
+                add_line(bldw, ms["loc"], k, highs[ms["loc"]], "BOS", "bullish")
+
+            if ms["bos"] is not None and c >= ms["bos"]:
+                add_line(bldw, ms.get("loc", k), k, ms["bos"], "BOS", "bullish")
+                id_bull = _bb_find_idx(bars, k, ms["loc"], use_max=False, use_ob=False)
+                add_ob(True, top_p, id_bull)
+                ms["bos"] = None
+                lo_idx = _bb_find_idx(bars, k, k, use_max=False, use_ob=False)
+                ms["choch"] = lows[lo_idx]
+                ms["loc"] = lo_idx
+                add_line(brdw, lo_idx, k, lows[lo_idx], "CHoCH", "bearish")
+
+            elif ms["choch"] is not None and c <= ms["choch"]:
+                add_line(brdw, ms.get("xloc", k), k, ms["choch"], "CHoCH", "bearish")
+                id_bear = _bb_find_idx(bars, k, ms["loc"], use_max=True, use_ob=False)
+                add_ob(False, btm_p, id_bear)
+                ms.update({"trend": -1, "bos": None, "main": lows[k], "loc": k, "temp": k, "xloc": k})
+
+            if bldw:
+                bldw[0]["end_index"] = k
+                bldw[0]["time_end"] = _smc_ts(bars, k)
+            if brdw:
+                brdw[0]["end_index"] = k
+                brdw[0]["time_end"] = _smc_ts(bars, k)
+
+    # Mitigate OBs (Close method)
+    for block in blob + brob:
+        for k in range(block["left_idx"] + 1, n):
+            bar = bars[k]
+            block["right_idx"] = k
+            if block["type"] == "bullish":
+                if min(bar["close"], bar["open"]) < block["bottom"]:
+                    block["mitigated"] = True
+                    break
+            elif max(bar["close"], bar["open"]) > block["top"]:
+                block["mitigated"] = True
+                break
+
+    structures = (bldw[:swing_limit] + brdw[:swing_limit])[:swing_limit]
+    obs_raw = (blob[:ob_last] + brob[:ob_last])
+    total_vol = sum(o.get("volume", 0) for o in obs_raw) or 1
+    order_blocks: list[dict[str, Any]] = []
+    for ob in obs_raw[:ob_last]:
+        li = ob["left_idx"]
+        ri = min(ob.get("right_idx", n - 1), n - 1)
+        order_blocks.append({
+            "source": "bigbeluga",
+            "type": ob["type"],
+            "top": round(ob["top"], 5),
+            "bottom": round(ob["bottom"], 5),
+            "avg": round(ob["avg"], 5),
+            "time_start": _smc_ts(bars, li),
+            "time_end": _smc_ts(bars, ri),
+            "mitigated": bool(ob["mitigated"]),
+            "volume": ob.get("volume", 0),
+            "volume_pct": round(100.0 * ob.get("volume", 0) / total_vol, 1),
+        })
+
+    return {
+        "source": "bigbeluga",
+        "trend": ms.get("trend", 0),
+        "fvgs": fvgs_out,
+        "structures": structures,
+        "order_blocks": order_blocks,
+        "fvg_count": len(fvgs_out),
+        "structure_count": len(structures),
+        "ob_count": len(order_blocks),
+    }
+
+
+
 def analyze_smc_structures_fvg(
     bars: list[dict[str, Any]],
     *,
@@ -3812,6 +4305,7 @@ def analyze_smc_structures_fvg(
         if low_broken:
             label = "BOS" if structure_direction == 1 else "CHoCH"
             structures.append({
+                "source": "ludo",
                 "label": label,
                 "kind": "bearish",
                 "level": round(structure_low, 5),
@@ -3834,6 +4328,7 @@ def analyze_smc_structures_fvg(
         elif high_broken:
             label = "BOS" if structure_direction == 2 else "CHoCH"
             structures.append({
+                "source": "ludo",
                 "label": label,
                 "kind": "bullish",
                 "level": round(structure_high, 5),
@@ -3876,6 +4371,7 @@ def analyze_smc_structures_fvg(
     # Serialize FVGs
     for box in fvg_boxes[-fvg_history:]:
         fvgs_out.append({
+            "source": "ludo",
             "type": box["type"],
             "top": round(box["top"], 5),
             "bottom": round(box["bottom"], 5),
@@ -3917,6 +4413,19 @@ def analyze_smc_structures_fvg(
         "fvg_count": len(fvgs_out),
         "structure_count": len(structures),
     }
+
+
+def analyze_smc_merged(bars: list[dict[str, Any]], **kwargs: Any) -> dict[str, Any]:
+    """LudoGH68 SMC + BigBeluga SMC combined for chart overlays."""
+    ludo = analyze_smc_structures_fvg(bars, **kwargs)
+    beluga = analyze_bigbeluga_smc(bars)
+    inducements = detect_inducements(bars, beluga=beluga)
+    out = {**ludo, "beluga": beluga, "inducements": inducements, "sources": ["ludo", "bigbeluga"]}
+    out["fvg_count"] = int(ludo.get("fvg_count", 0)) + int(beluga.get("fvg_count", 0))
+    out["structure_count"] = int(ludo.get("structure_count", 0)) + int(beluga.get("structure_count", 0))
+    out["ob_count"] = int(beluga.get("ob_count", 0))
+    out["inducement_count"] = len(inducements)
+    return out
 
 
 def rates_to_bars(rates) -> list[dict[str, Any]]:
@@ -3966,6 +4475,111 @@ def find_swing_points(bars: list[dict[str, Any]], lookback: int = 3) -> tuple[li
         if all(bars[i - j]["low"] > l and bars[i + j]["low"] > l for j in range(1, lookback + 1)):
             swing_lows.append({"index": i, "time": bars[i]["time"], "price": l})
     return swing_highs, swing_lows
+
+
+def detect_inducements(
+    bars: list[dict[str, Any]],
+    *,
+    beluga: dict[str, Any] | None = None,
+    swing_lookback: int = 5,
+    max_events: int = 12,
+    scan_bars: int = 220,
+) -> list[dict[str, Any]]:
+    """
+    Inducement = liquidity grab through a swing (wick sweep + close back inside).
+    Also picks up BigBeluga structure sweeps when present.
+    """
+    n = len(bars)
+    if n < swing_lookback * 2 + 5:
+        return []
+
+    swing_h, swing_l = find_swing_points(bars, swing_lookback)
+    atr = calc_atr_series(bars, 14)
+    events: list[dict[str, Any]] = []
+    seen_times: set[str] = set()
+
+    def push_event(
+        *,
+        kind: str,
+        level: float,
+        sweep_price: float,
+        bar_idx: int,
+        swing_idx: int,
+        source: str,
+    ) -> None:
+        t_iso = _smc_ts(bars, bar_idx)
+        if t_iso in seen_times:
+            return
+        seen_times.add(t_iso)
+        events.append({
+            "kind": kind,
+            "label": "INDUCEMENT",
+            "level": round(level, 5),
+            "sweep_price": round(sweep_price, 5),
+            "time": t_iso,
+            "swing_time": _smc_ts(bars, swing_idx),
+            "source": source,
+        })
+
+    start = max(swing_lookback, n - scan_bars)
+    recent_lows = [s for s in swing_l if s["index"] < n - 1][-14:]
+    recent_highs = [s for s in swing_h if s["index"] < n - 1][-14:]
+
+    for k in range(start, n):
+        bar = bars[k]
+        min_wick = max((atr[k] if k < len(atr) else 0) * 0.06, (bar["high"] - bar["low"]) * 0.15)
+
+        for sl in recent_lows:
+            if sl["index"] >= k - 1:
+                continue
+            level = sl["price"]
+            if bar["low"] < level and bar["close"] > level and (level - bar["low"]) >= min_wick:
+                push_event(
+                    kind="bullish",
+                    level=level,
+                    sweep_price=bar["low"],
+                    bar_idx=k,
+                    swing_idx=sl["index"],
+                    source="liquidity_sweep",
+                )
+                break
+
+        for sh in recent_highs:
+            if sh["index"] >= k - 1:
+                continue
+            level = sh["price"]
+            if bar["high"] > level and bar["close"] < level and (bar["high"] - level) >= min_wick:
+                push_event(
+                    kind="bearish",
+                    level=level,
+                    sweep_price=bar["high"],
+                    bar_idx=k,
+                    swing_idx=sh["index"],
+                    source="liquidity_sweep",
+                )
+                break
+
+    if beluga:
+        for st in beluga.get("structures") or []:
+            if not st.get("sweep"):
+                continue
+            t_iso = st.get("time_end")
+            if not t_iso or t_iso in seen_times:
+                continue
+            seen_times.add(t_iso)
+            kind = "bearish" if st.get("kind") == "bearish" else "bullish"
+            events.append({
+                "kind": kind,
+                "label": "INDUCEMENT",
+                "level": st.get("level"),
+                "sweep_price": st.get("level"),
+                "time": t_iso,
+                "swing_time": st.get("time_start"),
+                "source": "bigbeluga_sweep",
+            })
+
+    events.sort(key=lambda e: e.get("time") or "")
+    return events[-max_events:]
 
 
 def find_order_blocks(bars: list[dict[str, Any]], swing_highs: list, swing_lows: list) -> list[dict[str, Any]]:
@@ -4278,8 +4892,9 @@ def build_chart_analysis(sym: str, chart_tf: str, count: int = 200) -> dict[str,
     else:
         overall = "NEUTRAL"
 
-    smc = analyze_smc_structures_fvg(bars)
+    smc = analyze_smc_merged(bars)
     last_br = smc.get("last_break") or {}
+    beluga = smc.get("beluga") or {}
 
     tick = mt5.symbol_info_tick(sym)
     return {
@@ -4300,6 +4915,9 @@ def build_chart_analysis(sym: str, chart_tf: str, count: int = 200) -> dict[str,
             "smc_fvg_count": smc.get("fvg_count", 0),
             "smc_last_break": last_br.get("label"),
             "smc_last_break_kind": last_br.get("kind"),
+            "smc_beluga_trend": beluga.get("trend"),
+            "smc_beluga_ob_count": beluga.get("ob_count", 0),
+            "smc_inducement_count": smc.get("inducement_count", 0),
             "atr": round(
                 sum(max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1]))
                     for i in range(1, min(15, len(closes)))) / 14,
