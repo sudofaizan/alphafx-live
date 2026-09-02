@@ -83,7 +83,7 @@ from flask import Flask, jsonify, request
 # Config
 # ---------------------------------------------------------------------------
 API_KEY = "alphafx"
-API_VERSION = "1.8.3"
+API_VERSION = "1.8.4"
 MT5_PATH = os.environ.get("MT5_TERMINAL_PATH", "")
 HOST = "0.0.0.0"
 PORT = 8080
@@ -3653,6 +3653,272 @@ def find_rsi_divergences(
     return divergences[:max_results]
 
 
+def _highestbars_offset(highs: list[float], k: int, length: int) -> int:
+    """TradingView ta.highestbars — negative offset from k to highest in window."""
+    start = max(0, k - length + 1)
+    window = highs[start: k + 1]
+    if not window:
+        return 0
+    abs_idx = start + window.index(max(window))
+    return abs_idx - k
+
+
+def _lowestbars_offset(lows: list[float], k: int, length: int) -> int:
+    start = max(0, k - length + 1)
+    window = lows[start: k + 1]
+    if not window:
+        return 0
+    abs_idx = start + window.index(min(window))
+    return abs_idx - k
+
+
+def _structure_highest_bar(highs: list[float], k: int, lookback: int = 10) -> int:
+    length = lookback if k > lookback else k + 1
+    max_bar = _highestbars_offset(highs, k, length)
+    idx = 0
+    for i in range(lookback):
+        o1, o2, o0 = k - (i + 1), k - (i + 2), k - i
+        if o2 < 0:
+            break
+        if highs[o1] > highs[o2] and highs[o0] <= highs[o1] and (-(i + 1)) >= max_bar:
+            idx = -(i + 1)
+    return idx if idx != 0 else max_bar
+
+
+def _structure_lowest_bar(lows: list[float], k: int, lookback: int = 10) -> int:
+    length = lookback if k > lookback else k + 1
+    min_bar = _lowestbars_offset(lows, k, length)
+    idx = 0
+    for i in range(lookback):
+        o1, o2, o0 = k - (i + 1), k - (i + 2), k - i
+        if o2 < 0:
+            break
+        if lows[o1] < lows[o2] and lows[o0] >= lows[o1] and (-(i + 1)) >= min_bar:
+            idx = -(i + 1)
+    return idx if idx != 0 else min_bar
+
+
+def _smc_ts(bars: list[dict[str, Any]], idx: int) -> str:
+    return datetime.utcfromtimestamp(bars[idx]["time"]).isoformat() + "Z"
+
+
+def analyze_smc_structures_fvg(
+    bars: list[dict[str, Any]],
+    *,
+    body_break: bool = True,
+    fvg_history: int = 5,
+    struct_history: int = 10,
+    lookback: int = 10,
+    fib_levels: tuple[float, ...] = (0.786, 0.705, 0.618, 0.5, 0.382),
+) -> dict[str, Any]:
+    """
+    LudoGH68 « SMC Structures and FVG » (TradingView) — FVG + BOS/CHoCH + structure fibs.
+    """
+    n = len(bars)
+    if n < 5:
+        return {"fvgs": [], "structures": [], "current": None}
+
+    highs = [b["high"] for b in bars]
+    lows = [b["low"] for b in bars]
+    closes = [b["close"] for b in bars]
+
+    def low_px(k: int) -> float:
+        return closes[k] if body_break else lows[k]
+
+    def high_px(k: int) -> float:
+        return closes[k] if body_break else highs[k]
+
+    # Active FVG zones (mutable during scan)
+    fvg_boxes: list[dict[str, Any]] = []
+    fvgs_out: list[dict[str, Any]] = []
+
+    structure_high = highs[0]
+    structure_low = lows[0]
+    structure_high_start = 0
+    structure_low_start = 0
+    structure_direction = 0  # 0=init, 1=bearish leg, 2=bullish leg
+    structures: list[dict[str, Any]] = []
+
+    for k in range(n):
+        # --- FVG detection (Pine: high[3] < low[1] / low[3] > high[1]) ---
+        if k >= 3:
+            if highs[k - 3] < lows[k - 1]:
+                fvg_boxes.append({
+                    "type": "bullish",
+                    "left_idx": k - 2,
+                    "right_idx": k - 1,
+                    "top": lows[k - 1],
+                    "bottom": highs[k - 3],
+                    "mitigated": False,
+                })
+            if lows[k - 3] > highs[k - 1]:
+                fvg_boxes.append({
+                    "type": "bearish",
+                    "left_idx": k - 2,
+                    "right_idx": k - 1,
+                    "top": lows[k - 3],
+                    "bottom": highs[k - 1],
+                    "mitigated": False,
+                })
+            while len(fvg_boxes) > fvg_history + 1:
+                fvg_boxes.pop(0)
+
+        # --- FVG mitigation + extend right edge ---
+        still_active: list[dict[str, Any]] = []
+        for box in fvg_boxes:
+            box["right_idx"] = k
+            if box["type"] == "bullish":
+                if lows[k] <= box["bottom"]:
+                    continue
+                if lows[k] < box["top"]:
+                    box["mitigated"] = True
+            else:
+                if highs[k] >= box["top"]:
+                    continue
+                if highs[k] > box["bottom"]:
+                    box["mitigated"] = True
+            still_active.append(box)
+        fvg_boxes = still_active
+
+        if k < 3:
+            continue
+
+        # --- Structure breaks ---
+        lb = low_px(k)
+        hb = high_px(k)
+        lb1, lb2, lb3 = low_px(k - 1), low_px(k - 2), low_px(k - 3)
+        hb1, hb2, hb3 = high_px(k - 1), high_px(k - 2), high_px(k - 3)
+
+        low_broken = (
+            lb < structure_low
+            and lb1 >= structure_low
+            and lb2 >= structure_low
+            and lb3 >= structure_low
+            and (k - 1) > structure_low_start
+            and (k - 2) > structure_low_start
+            and (k - 3) > structure_low_start
+        ) or (structure_direction == 2 and lb < structure_low)
+
+        high_broken = (
+            hb > structure_high
+            and hb1 <= structure_high
+            and hb2 <= structure_high
+            and hb3 <= structure_high
+            and (k - 1) > structure_high_start
+            and (k - 2) > structure_high_start
+            and (k - 3) > structure_high_start
+        ) or (structure_direction == 1 and hb > structure_high)
+
+        if low_broken:
+            label = "BOS" if structure_direction == 1 else "CHoCH"
+            structures.append({
+                "label": label,
+                "kind": "bearish",
+                "level": round(structure_low, 5),
+                "time_start": _smc_ts(bars, structure_low_start),
+                "time_end": _smc_ts(bars, k),
+                "start_index": structure_low_start,
+                "end_index": k,
+            })
+            while len(structures) > struct_history:
+                structures.pop(0)
+
+            structure_direction = 1
+            hi_off = _structure_highest_bar(highs, k, lookback)
+            structure_high_start = k + hi_off
+            structure_high_start = max(0, min(structure_high_start, k))
+            structure_low_start = k
+            structure_high = highs[structure_high_start]
+            structure_low = lows[k]
+
+        elif high_broken:
+            label = "BOS" if structure_direction == 2 else "CHoCH"
+            structures.append({
+                "label": label,
+                "kind": "bullish",
+                "level": round(structure_high, 5),
+                "time_start": _smc_ts(bars, structure_high_start),
+                "time_end": _smc_ts(bars, k),
+                "start_index": structure_high_start,
+                "end_index": k,
+            })
+            while len(structures) > struct_history:
+                structures.pop(0)
+
+            structure_direction = 2
+            lo_off = _structure_lowest_bar(lows, k, lookback)
+            structure_high_start = k
+            structure_low_start = k + lo_off
+            structure_low_start = max(0, min(structure_low_start, k))
+            structure_high = highs[k]
+            structure_low = lows[structure_low_start]
+
+        else:
+            if highs[k] > structure_high and structure_direction in (0, 2):
+                skip = body_break and (
+                    (k - 1) > structure_high_start
+                    and (k - 2) > structure_high_start
+                    and (k - 3) > structure_high_start
+                )
+                if not body_break or not skip:
+                    structure_high = highs[k]
+                    structure_high_start = k
+            elif lows[k] < structure_low and structure_direction in (0, 1):
+                skip = body_break and (
+                    (k - 1) > structure_low_start
+                    and (k - 2) > structure_low_start
+                    and (k - 3) > structure_low_start
+                )
+                if not body_break or not skip:
+                    structure_low = lows[k]
+                    structure_low_start = k
+
+    # Serialize FVGs
+    for box in fvg_boxes[-fvg_history:]:
+        fvgs_out.append({
+            "type": box["type"],
+            "top": round(box["top"], 5),
+            "bottom": round(box["bottom"], 5),
+            "time_start": _smc_ts(bars, box["left_idx"]),
+            "time_end": _smc_ts(bars, box["right_idx"]),
+            "mitigated": bool(box["mitigated"]),
+        })
+
+    structure_range = abs(structure_high - structure_low)
+    fibs: list[dict[str, Any]] = []
+    for fib_val in fib_levels:
+        if structure_direction == 1:
+            price = structure_high - (structure_range - structure_range * fib_val)
+            start_idx = structure_high_start
+        else:
+            price = structure_low + (structure_range - structure_range * fib_val)
+            start_idx = structure_low_start
+        fibs.append({
+            "value": fib_val,
+            "price": round(price, 5),
+            "time_start": _smc_ts(bars, start_idx),
+        })
+
+    last_struct = structures[-1] if structures else None
+    return {
+        "fvgs": fvgs_out,
+        "structures": structures,
+        "current": {
+            "direction": structure_direction,
+            "structure_high": round(structure_high, 5),
+            "structure_low": round(structure_low, 5),
+            "high_start": _smc_ts(bars, structure_high_start),
+            "low_start": _smc_ts(bars, structure_low_start),
+            "high_end": _smc_ts(bars, n - 1),
+            "low_end": _smc_ts(bars, n - 1),
+            "fibonacci": fibs,
+        },
+        "last_break": last_struct,
+        "fvg_count": len(fvgs_out),
+        "structure_count": len(structures),
+    }
+
+
 def rates_to_bars(rates) -> list[dict[str, Any]]:
     bars = []
     for r in rates:
@@ -4012,6 +4278,9 @@ def build_chart_analysis(sym: str, chart_tf: str, count: int = 200) -> dict[str,
     else:
         overall = "NEUTRAL"
 
+    smc = analyze_smc_structures_fvg(bars)
+    last_br = smc.get("last_break") or {}
+
     tick = mt5.symbol_info_tick(sym)
     return {
         "ok": True,
@@ -4028,6 +4297,9 @@ def build_chart_analysis(sym: str, chart_tf: str, count: int = 200) -> dict[str,
             "rsi_divergence_label": latest_div["label"] if latest_div else None,
             "rsi_divergence_bull_count": bull_div_n,
             "rsi_divergence_bear_count": bear_div_n,
+            "smc_fvg_count": smc.get("fvg_count", 0),
+            "smc_last_break": last_br.get("label"),
+            "smc_last_break_kind": last_br.get("kind"),
             "atr": round(
                 sum(max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1]))
                     for i in range(1, min(15, len(closes)))) / 14,
@@ -4036,6 +4308,7 @@ def build_chart_analysis(sym: str, chart_tf: str, count: int = 200) -> dict[str,
         },
         "rsi_series": rsi_points[-120:],
         "rsi_divergences": rsi_divergences,
+        "smc": smc,
         "ema20": ema20_pts[-80:],
         "ema50": ema50_pts[-80:],
         "order_blocks": order_blocks,
