@@ -4481,13 +4481,15 @@ def detect_inducements(
     bars: list[dict[str, Any]],
     *,
     beluga: dict[str, Any] | None = None,
-    swing_lookback: int = 5,
-    max_events: int = 12,
-    scan_bars: int = 220,
+    swing_lookback: int = 6,
+    max_events: int = 6,
+    scan_bars: int = 180,
+    min_swing_age_bars: int = 5,
+    min_gap_bars: int = 10,
 ) -> list[dict[str, Any]]:
     """
     Inducement = liquidity grab through a swing (wick sweep + close back inside).
-    Also picks up BigBeluga structure sweeps when present.
+    Kept strict: significant wick only, one per swing level, spaced apart.
     """
     n = len(bars)
     if n < swing_lookback * 2 + 5:
@@ -4497,6 +4499,11 @@ def detect_inducements(
     atr = calc_atr_series(bars, 14)
     events: list[dict[str, Any]] = []
     seen_times: set[str] = set()
+    seen_levels: set[float] = set()
+    last_event_bar = -10_000
+
+    def level_key(price: float) -> float:
+        return round(price, 1 if price > 10 else 5)
 
     def push_event(
         *,
@@ -4507,10 +4514,18 @@ def detect_inducements(
         swing_idx: int,
         source: str,
     ) -> None:
+        nonlocal last_event_bar
+        if bar_idx - last_event_bar < min_gap_bars:
+            return
+        lk = level_key(level)
+        if lk in seen_levels:
+            return
         t_iso = _smc_ts(bars, bar_idx)
         if t_iso in seen_times:
             return
         seen_times.add(t_iso)
+        seen_levels.add(lk)
+        last_event_bar = bar_idx
         events.append({
             "kind": kind,
             "label": "INDUCEMENT",
@@ -4522,18 +4537,22 @@ def detect_inducements(
         })
 
     start = max(swing_lookback, n - scan_bars)
-    recent_lows = [s for s in swing_l if s["index"] < n - 1][-14:]
-    recent_highs = [s for s in swing_h if s["index"] < n - 1][-14:]
+    recent_lows = [s for s in swing_l if s["index"] < n - min_swing_age_bars][-6:]
+    recent_highs = [s for s in swing_h if s["index"] < n - min_swing_age_bars][-6:]
 
     for k in range(start, n):
         bar = bars[k]
-        min_wick = max((atr[k] if k < len(atr) else 0) * 0.06, (bar["high"] - bar["low"]) * 0.15)
+        bar_rng = bar["high"] - bar["low"]
+        min_wick = max((atr[k] if k < len(atr) else 0) * 0.15, bar_rng * 0.35)
+        if bar_rng < min_wick:
+            continue
 
         for sl in recent_lows:
-            if sl["index"] >= k - 1:
+            if sl["index"] >= k - min_swing_age_bars:
                 continue
             level = sl["price"]
-            if bar["low"] < level and bar["close"] > level and (level - bar["low"]) >= min_wick:
+            wick = level - bar["low"]
+            if bar["low"] < level and bar["close"] > level and wick >= min_wick:
                 push_event(
                     kind="bullish",
                     level=level,
@@ -4545,10 +4564,11 @@ def detect_inducements(
                 break
 
         for sh in recent_highs:
-            if sh["index"] >= k - 1:
+            if sh["index"] >= k - min_swing_age_bars:
                 continue
             level = sh["price"]
-            if bar["high"] > level and bar["close"] < level and (bar["high"] - level) >= min_wick:
+            wick = bar["high"] - level
+            if bar["high"] > level and bar["close"] < level and wick >= min_wick:
                 push_event(
                     kind="bearish",
                     level=level,
@@ -4558,25 +4578,6 @@ def detect_inducements(
                     source="liquidity_sweep",
                 )
                 break
-
-    if beluga:
-        for st in beluga.get("structures") or []:
-            if not st.get("sweep"):
-                continue
-            t_iso = st.get("time_end")
-            if not t_iso or t_iso in seen_times:
-                continue
-            seen_times.add(t_iso)
-            kind = "bearish" if st.get("kind") == "bearish" else "bullish"
-            events.append({
-                "kind": kind,
-                "label": "INDUCEMENT",
-                "level": st.get("level"),
-                "sweep_price": st.get("level"),
-                "time": t_iso,
-                "swing_time": st.get("time_start"),
-                "source": "bigbeluga_sweep",
-            })
 
     events.sort(key=lambda e: e.get("time") or "")
     return events[-max_events:]
