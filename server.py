@@ -84,7 +84,7 @@ from flask import Flask, jsonify, request
 # Config
 # ---------------------------------------------------------------------------
 API_KEY = "alphafx"
-API_VERSION = "1.8.6"
+API_VERSION = "1.8.7"
 MT5_PATH = os.environ.get("MT5_TERMINAL_PATH", "")
 HOST = "0.0.0.0"
 PORT = 8080
@@ -1083,6 +1083,8 @@ def build_account_health() -> dict[str, Any]:
             "profit": round(floating_profit, 2),
             "swap": round(floating_swap, 2),
         },
+        "positions": [pos_to_dict(p) for p in positions],
+        "orders": [order_to_dict(o) for o in orders],
         "today": {
             "closed_pl": round(closed_today, 2),
             "deals_count": len(deals),
