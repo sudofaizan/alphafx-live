@@ -28,6 +28,7 @@ Endpoints:
   POST /placeOrder
   POST /placeTrades
   GET  /getPositions
+  GET  /getOrders
   POST /closePositions
   POST /modifyPosition
   POST /trailPosition_MODE1
@@ -324,6 +325,40 @@ def pos_to_dict(p) -> dict[str, Any]:
         "swap": p.swap,
         "magic": p.magic,
         "comment": p.comment,
+    }
+
+
+def order_to_dict(o) -> dict[str, Any]:
+    type_map = {
+        mt5.ORDER_TYPE_BUY: "buy",
+        mt5.ORDER_TYPE_SELL: "sell",
+        mt5.ORDER_TYPE_BUY_LIMIT: "buy_limit",
+        mt5.ORDER_TYPE_SELL_LIMIT: "sell_limit",
+        mt5.ORDER_TYPE_BUY_STOP: "buy_stop",
+        mt5.ORDER_TYPE_SELL_STOP: "sell_stop",
+        mt5.ORDER_TYPE_BUY_STOP_LIMIT: "buy_stop_limit",
+        mt5.ORDER_TYPE_SELL_STOP_LIMIT: "sell_stop_limit",
+        mt5.ORDER_TYPE_CLOSE_BY: "close_by",
+    }
+    return {
+        "ticket": o.ticket,
+        "symbol": o.symbol,
+        "type": type_map.get(o.type, str(o.type)),
+        "volume": o.volume_current,
+        "volume_initial": o.volume_initial,
+        "price": o.price_open,
+        "sl": o.sl,
+        "tp": o.tp,
+        "magic": o.magic,
+        "comment": o.comment,
+        "time_setup": (
+            datetime.utcfromtimestamp(int(o.time_setup)).isoformat() + "Z"
+            if o.time_setup else None
+        ),
+        "time_expiration": (
+            datetime.utcfromtimestamp(int(o.time_expiration)).isoformat() + "Z"
+            if o.time_expiration else None
+        ),
     }
 
 
@@ -4893,9 +4928,10 @@ def build_chart_analysis(sym: str, chart_tf: str, count: int = 200) -> dict[str,
     else:
         overall = "NEUTRAL"
 
-    smc = analyze_smc_merged(bars)
+    smc = analyze_smc_structures_fvg(bars, fvg_history=3, struct_history=5)
+    smc["inducements"] = detect_inducements(bars)
+    smc["inducement_count"] = len(smc["inducements"])
     last_br = smc.get("last_break") or {}
-    beluga = smc.get("beluga") or {}
 
     tick = mt5.symbol_info_tick(sym)
     return {
@@ -4916,8 +4952,6 @@ def build_chart_analysis(sym: str, chart_tf: str, count: int = 200) -> dict[str,
             "smc_fvg_count": smc.get("fvg_count", 0),
             "smc_last_break": last_br.get("label"),
             "smc_last_break_kind": last_br.get("kind"),
-            "smc_beluga_trend": beluga.get("trend"),
-            "smc_beluga_ob_count": beluga.get("ob_count", 0),
             "smc_inducement_count": smc.get("inducement_count", 0),
             "atr": round(
                 sum(max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1]))
@@ -5508,6 +5542,33 @@ def get_positions():
         rows = [p for p in rows if p["magic"] == int(magic)]
 
     return jsonify({"ok": True, "count": len(rows), "total_profit": sum(p["profit"] for p in rows), "positions": rows})
+
+
+@app.route("/getOrders", methods=["GET"])
+@require_api_key
+@require_mt5
+def get_orders():
+    """Pending/active orders (limits, stops). ?symbol= &ticket= &magic="""
+    symbol = request.args.get("symbol")
+    ticket = request.args.get("ticket")
+    magic = request.args.get("magic")
+
+    if ticket:
+        orders = mt5.orders_get(ticket=int(ticket))
+    elif symbol:
+        _, sym = resolve_symbol(symbol)
+        orders = mt5.orders_get(symbol=sym)
+    else:
+        orders = mt5.orders_get()
+
+    if orders is None:
+        return jsonify({"ok": False, **last_error()}), 400
+
+    rows = [order_to_dict(o) for o in orders]
+    if magic is not None:
+        rows = [o for o in rows if o["magic"] == int(magic)]
+
+    return jsonify({"ok": True, "count": len(rows), "orders": rows})
 
 
 @app.route("/closePositions", methods=["POST"])
