@@ -4933,6 +4933,7 @@ def build_chart_analysis(sym: str, chart_tf: str, count: int = 200) -> dict[str,
     smc = analyze_smc_structures_fvg(bars, fvg_history=3, struct_history=5)
     smc["inducements"] = detect_inducements(bars)
     smc["inducement_count"] = len(smc["inducements"])
+    beluga_smc = analyze_bigbeluga_smc(bars, ob_last=5, fvg_num=5, swing_limit=100)
     last_br = smc.get("last_break") or {}
 
     tick = mt5.symbol_info_tick(sym)
@@ -4955,6 +4956,10 @@ def build_chart_analysis(sym: str, chart_tf: str, count: int = 200) -> dict[str,
             "smc_last_break": last_br.get("label"),
             "smc_last_break_kind": last_br.get("kind"),
             "smc_inducement_count": smc.get("inducement_count", 0),
+            "beluga_fvg_count": beluga_smc.get("fvg_count", 0),
+            "beluga_ob_count": beluga_smc.get("ob_count", 0),
+            "beluga_structure_count": beluga_smc.get("structure_count", 0),
+            "beluga_trend": beluga_smc.get("trend", 0),
             "atr": round(
                 sum(max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1]))
                     for i in range(1, min(15, len(closes)))) / 14,
@@ -4964,6 +4969,7 @@ def build_chart_analysis(sym: str, chart_tf: str, count: int = 200) -> dict[str,
         "rsi_series": rsi_points[-120:],
         "rsi_divergences": rsi_divergences,
         "smc": smc,
+        "beluga_smc": beluga_smc,
         "ema20": ema20_pts[-80:],
         "ema50": ema50_pts[-80:],
         "order_blocks": order_blocks,
